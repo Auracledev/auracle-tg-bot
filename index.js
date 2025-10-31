@@ -417,6 +417,29 @@ bot.launch().then(async () => {
   cron.schedule(`*/${interval} * * * * *`, tick);
 });
 
+// --- tiny HTTP server so Railway/hosts that expect $PORT don't kill the process ---
+import http from 'http';
+
+const PORT = process.env.PORT || 3000;
+
+const server = http.createServer(async (req, res) => {
+  if (req.url === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const state = (() => {
+      try { return JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf8')); }
+      catch { return { markets: {} }; }
+    })();
+    res.end(JSON.stringify({ ok: true, marketsTracked: Object.keys(state.markets || {}).length }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Auracle Telegram bot is running.\n');
+});
+
+server.listen(PORT, () => {
+  console.log(`[http] listening on :${PORT}`);
+});
+
 // ----------------- GRACEFUL SHUTDOWN -----------------
 process.once('SIGINT', async () => {
   try { if (browser) await browser.close(); } catch {}

@@ -1,15 +1,18 @@
 {
   "name": "auracle-telegram-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=20 <21" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20 <21"
+  },
   "dependencies": {
-    "cheerio": "^1.0.0",
     "dotenv": "^16.4.5",
     "node-cron": "^3.0.3",
-    "node-fetch": "^3.3.2",
+    "puppeteer": "^22.13.1",
     "telegraf": "^4.16.3"
   }
 }

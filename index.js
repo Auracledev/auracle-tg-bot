@@ -49,7 +49,7 @@ if (!fs.existsSync(STATE_FILE)) {
 //   missingCount: number,
 //   lastSeen: { title, category, endsIn, options },
 //   closedSnapshot: { options },
-//   wasTrending: boolean,     // seen in Trending last tick
+//   wasTrending: boolean,
 // }
 const loadState = () => {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
@@ -158,10 +158,8 @@ function extractIdFromUrl(u) {
 }
 
 /**
- * Section-aware classifier using HOT badges:
- * - If a card contains text like "#1 HOT", "#2 HOT", it's Trending
- * - Otherwise it's Active
- * We ONLY return id/url and lightweight meta (no titles).
+ * Classify list cards with HOT badge → Trending, else Active.
+ * Only return id/url and light meta (no titles).
  */
 async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
@@ -173,7 +171,6 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
       if (debug || dbg) console.log('[sections] goto', url);
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-      // Wait for any market links and scroll to load lazy content
       try {
         await page.waitForFunction(
           () => !!document.querySelector('a[href*="MarketDetails?id="], a[href*="/markets/"]'),
@@ -206,7 +203,6 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
 
           const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
-          // meta we keep (no titles)
           const category =
             text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
 
@@ -216,7 +212,6 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           const endsCand = smalls.find(t => /in\b.*(hour|day|minute|about)/i.test(t) || /about/i.test(t));
           if (endsCand) endsIn = endsCand;
 
-          // Try to snapshot options for open
           const rowSelectors = [
             '.option', '.side', '.row',
             '.left, .center, .right',
@@ -249,7 +244,6 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             if (options.length >= 3) break;
           }
 
-          // Extract ID
           let id = null;
           try {
             const u = new URL(abs);
@@ -273,12 +267,9 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
         for (const { entry, trending } of byKey.values()) {
           if (trending) trendingArr.push(entry); else activeArr.push(entry);
         }
-
-        // Fallback: if everything looked trending, treat them as active
         if (activeArr.length === 0 && trendingArr.length > 0) {
           return { trending: [], active: trendingArr };
         }
-
         return { trending: trendingArr, active: activeArr };
       });
 
@@ -292,7 +283,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
   return { trending: [], active: [] };
 }
 
-// Scrape a MarketDetails page and determine status via explicit Auracle text
+// --------- DETAIL SCRAPER (robust title) ----------
 async function scrapeMarketDetail(url, { debug = false } = {}) {
   const page = await newPage();
   if (debug || dbg) console.log('[detail] goto', url);
@@ -304,6 +295,64 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 
   const data = await page.evaluate(() => {
     const text = (el) => (el?.textContent || '').trim();
+    const up = (s) => (s || '').toUpperCase();
+
+    // 1) Prefer OpenGraph
+    const og = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
+
+    // 2) Visible heading candidates
+    const nodes = Array.from(document.querySelectorAll(
+      'h1, h2, h3, .market-title, [data-testid="market-title"], .title, .text-3xl, .text-2xl'
+    ));
+    const bad = /^(AURACLE|BACK TO AURACLES|PREDICT THE FUTURE)$/i;
+
+    const scoreTitle = (s) => {
+      if (!s) return -1e9;
+      let t = s.replace(/\s+/g, ' ').trim();
+      if (bad.test(t)) return -1e9;
+      // downweight generic page titles
+      if (/AURACLE\s*(•|-|—|\|)/i.test(t)) return -1000;
+
+      let score = 0;
+      if (/\bvs\b/i.test(t)) score += 50;
+      if (/\?/.test(t)) score += 30;
+      if (t.length >= 12) score += 10;
+      score += Math.min(60, t.length / 2); // prefer longer, capped
+      return score;
+    };
+
+    const cand = [];
+    if (og) cand.push({ t: og, s: scoreTitle(og) });
+
+    for (const n of nodes) {
+      const t = text(n);
+      cand.push({ t, s: scoreTitle(t) });
+    }
+
+    // If we see percentage boxes, try to grab heading in same block
+    const pct = document.querySelector('[data-testid="option-percent"], .option-percent, .percentage, .percent');
+    if (pct) {
+      const blk = pct.closest('article, section, div');
+      if (blk) {
+        const localHead = blk.querySelector('h1, h2, h3, .market-title, .title');
+        if (localHead) {
+          const t = text(localHead);
+          cand.push({ t, s: scoreTitle(t) + 5 });
+        }
+      }
+    }
+
+    cand.sort((a, b) => b.s - a.s);
+    let bestTitle = (cand.find(x => x.s > 0)?.t || '').trim();
+
+    // 3) Last resort: strip site name from tab title
+    if (!bestTitle) {
+      let dt = (document.title || '').trim();
+      // split on common separators and drop site name chunks
+      let parts = dt.split(/[\|\-•—]/).map(s => s.trim()).filter(Boolean);
+      parts = parts.filter(p => !/^AURACLE$/i.test(p));
+      bestTitle = parts[0] || dt;
+    }
 
     const getPctFromNode = (node) => {
       if (!node) return null;
@@ -312,19 +361,13 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       return Number.isFinite(n) ? Math.round(n) : null;
     };
 
-    const title =
-      text(document.querySelector('.market-title, h1, h2, [data-testid="market-title"]')) ||
-      document.title || '';
-
     const pageTextRaw = document.body?.innerText || '';
-    const pageTextUP  = pageTextRaw.toUpperCase();
+    const pageTextUP  = up(pageTextRaw);
     const isClosedText = pageTextUP.includes('ORACLE CLOSED - AWAITING RESOLUTION');
 
     let winner = null;
     const resolvedMatch = pageTextRaw.match(/ORACLE RESOLVED:\s*(.+)$/mi);
-    if (resolvedMatch && resolvedMatch[1]) {
-      winner = resolvedMatch[1].trim();
-    }
+    if (resolvedMatch && resolvedMatch[1]) winner = resolvedMatch[1].trim();
 
     const optionRowSelectors = [
       '.option', '.side',
@@ -379,11 +422,11 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
     } catch {}
 
-    return { id, title, url: location.href, status, options, winner: winner || null };
+    return { id, title: bestTitle, url: location.href, status, options, winner: winner || null };
   });
 
   await page.close();
-  if (debug || dbg) console.log('[detail] scraped', data ? `${data.id} status: ${data.status}` : 'null');
+  if (debug || dbg) console.log('[detail] scraped', data ? `${data.id} title="${data.title}" status: ${data.status}` : 'null');
   return data;
 }
 
@@ -460,7 +503,6 @@ async function tick() {
   try {
     if (dbg) console.log('[tick] run at', new Date().toISOString());
 
-    // 1) Read sections (IDs/URLs only) via HOT-badge classifier
     const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
 
     const activeIds   = new Set(active.map(m => m.id).filter(Boolean));
@@ -469,14 +511,13 @@ async function tick() {
     let state = loadState();
     if (!state || !state.markets) state = { markets: {}, seeded: false };
     const knownIds = new Set(Object.keys(state.markets));
-    const toWatch = new Set([...activeIds, ...knownIds]); // don't treat trending as new-open
+    const toWatch = new Set([...activeIds, ...knownIds]);
 
     if (dbg) console.log('[tick] active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
 
     const activeById   = new Map(active.map(m => [m.id, m]));
     const trendingById = new Map(trending.map(m => [m.id, m]));
 
-    // 2) Scrape details for watched IDs
     const base = AURACLE_BASE_URL.replace(/\/+$/, '');
     const results = [];
     for (const id of toWatch) {
@@ -490,7 +531,6 @@ async function tick() {
       const detail = await scrapeMarketDetail(url, { debug: dbg });
       if (!detail || !detail.id) continue;
 
-      // Merge richer list meta when OPEN (prefer Active card)
       if (detail.status === 'open') {
         const card = activeById.get(detail.id) || trendingById.get(detail.id);
         if (card) {
@@ -503,14 +543,13 @@ async function tick() {
       results.push(detail);
     }
 
-    // 3) Seed on first run (avoid spam)
     if (!state.seeded && results.length) {
       if (dbg) console.log('[seed] first run — seeding', results.length, 'markets');
       for (const m of results) {
         const inActive   = activeById.has(m.id);
         const card       = activeById.get(m.id) || trendingById.get(m.id);
         state.markets[m.id] = {
-          announcedOpen:     m.status === 'open' && inActive, // only mark open if listed in Active
+          announcedOpen:     m.status === 'open' && inActive,
           announcedClosed:   m.status === 'closed',
           announcedResolved: m.status === 'resolved',
           lastStatus:        m.status,
@@ -530,12 +569,10 @@ async function tick() {
 
     if (dbg) console.log('[tick] scraped details:', results.length);
 
-    // 4) Update missingCount vs Active ids
     for (const id of Object.keys(state.markets)) {
       state.markets[id].missingCount = activeIds.has(id) ? 0 : ((state.markets[id].missingCount || 0) + 1);
     }
 
-    // 5) Transitions + announcements
     for (const m of results) {
       const prev = state.markets[m.id] || {
         announcedOpen: false, announcedClosed: false, announcedResolved: false,
@@ -543,31 +580,27 @@ async function tick() {
       };
       const next = { ...prev, url: m.url };
 
-      // Keep lastSeen fresh while OPEN (prefer Active card, title from detail)
       if (m.status === 'open') {
         const card = activeById.get(m.id) || trendingById.get(m.id);
         const seenOpts = card?.options?.length ? card.options : m.options;
         next.lastSeen = {
-          title: m.title, // truth-source from detail page title
+          title: m.title,
           category: card?.category ?? m.category,
           endsIn: card?.endsIn ?? m.endsIn,
           options: Array.isArray(seenOpts) ? seenOpts : (prev.lastSeen?.options || [])
         };
       }
 
-      // Infer CLOSED if gone from Active for >=1 prior tick but detail says open
       if (!activeIds.has(m.id) && (prev.missingCount || 0) >= 1 && m.status === 'open') {
         if (dbg) console.log('[infer] CLOSED due to disappearance from Active:', m.id);
         m.status = 'closed';
       }
 
-      // On first CLOSED, snapshot final pool options
       if (m.status === 'closed' && !next.closedSnapshot) {
         const finalOpts = (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || [];
         next.closedSnapshot = { options: finalOpts };
       }
 
-      // ---- OPEN (only from Active section) ----
       if (m.status === 'open' && activeIds.has(m.id) && !prev.announcedOpen) {
         const card = activeById.get(m.id);
         const openPayload = {
@@ -583,7 +616,6 @@ async function tick() {
         next.announcedOpen = true;
       }
 
-      // ---- CLOSED ----
       if (m.status === 'closed' && !prev.announcedClosed) {
         const closedOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
@@ -593,7 +625,6 @@ async function tick() {
         next.announcedClosed = true;
       }
 
-      // ---- RESOLVED ----
       if (m.status === 'resolved' && !prev.announcedResolved) {
         const finalOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
@@ -603,7 +634,6 @@ async function tick() {
         next.announcedResolved = true;
       }
 
-      // ---- TRENDING transition ----
       const isTrendingNow = trendingIds.has(m.id);
       const wasTrendingBefore = !!prev.wasTrending;
       if (isTrendingNow && !wasTrendingBefore) {
@@ -634,7 +664,6 @@ async function tick() {
 // ----------------- COMMANDS -----------------
 bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
 
-// Health uses details to show real titles (no dupes)
 bot.command('health', async (ctx) => {
   try {
     const { trending, active } = await fetchMarketsFromSections({ debug: true });
@@ -677,7 +706,6 @@ bot.command('set_target', async (ctx) => {
   await ctx.reply(`OK. Target chat set to: ${id}`);
 });
 
-// Force announce from Active list, with detail-title correction
 bot.command('announce_open_now', async (ctx) => {
   const parts = (ctx.message.text || '').trim().split(/\s+/);
   const limit = Math.max(1, Math.min(parseInt(parts[1] || '3', 10) || 3, 20));

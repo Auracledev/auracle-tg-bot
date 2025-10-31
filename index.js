@@ -475,7 +475,7 @@ async function tick() {
     let state = loadState();
     if (!state || !state.markets) state = { markets: {}, seeded: false };
     const knownIds = new Set(Object.keys(state.markets));
-    const toWatch = new Set([...activeIds, ...knownIds]); // announce open only if in Active
+    const toWatch = new Set([...activeIds, ...knownIds]); // keep watching known + current active
 
     console.log('[tick] counts → active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
 
@@ -503,7 +503,6 @@ async function tick() {
           if (Array.isArray(card.options) && card.options.length >= 2) detail.options = card.options;
         }
       }
-
       results.push(detail);
     }
 
@@ -534,12 +533,13 @@ async function tick() {
 
     console.log('[tick] scraped detail count:', results.length);
 
-    // update missing counters
+    // update "missing" counter (not used for closure anymore, but useful telemetry)
     for (const id of Object.keys(state.markets)) {
-      state.markets[id].missingCount = activeIds.has(id) ? 0 : ((state.markets[id].missingCount || 0) + 1);
+      state.markets[id].missingCount =
+        (activeIds.has(id) || trendingIds.has(id)) ? 0 : ((state.markets[id].missingCount || 0) + 1);
     }
 
-    // transitions + announcements
+    // transitions + announcements (NO inferred close)
     for (const m of results) {
       const prev = state.markets[m.id] || {
         announcedOpen: false, announcedClosed: false, announcedResolved: false,
@@ -558,18 +558,14 @@ async function tick() {
         };
       }
 
-      // infer closed if disappeared from Active (but still scraping open)
-      if (!activeIds.has(m.id) && (prev.missingCount || 0) >= 1 && m.status === 'open') {
-        console.log('[infer] CLOSED due to disappearance from Active:', m.id);
-        m.status = 'closed';
-      }
+      // NO infer-close block anymore — only trust detail page
 
       if (m.status === 'closed' && !next.closedSnapshot) {
         const finalOpts = (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || [];
         next.closedSnapshot = { options: finalOpts };
       }
 
-      if (m.status === 'open' && activeIds.has(m.id) && !prev.announcedOpen) {
+      if (m.status === 'open' && activeById.has(m.id) && !prev.announcedOpen) {
         const card = activeById.get(m.id);
         const openPayload = {
           ...m,
@@ -602,6 +598,7 @@ async function tick() {
         next.announcedResolved = true;
       }
 
+      // Trending enter
       const isTrendingNow = trendingIds.has(m.id);
       const wasTrendingBefore = !!prev.wasTrending;
       if (isTrendingNow && !wasTrendingBefore) {

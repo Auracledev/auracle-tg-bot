@@ -13,12 +13,12 @@ const __dirname = path.dirname(__filename);
 // ----------------- ENV -----------------
 const {
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID,                // initial/fallback target; can be changed at runtime
+  TELEGRAM_CHAT_ID,
   AURACLE_BASE_URL = 'https://auracle.fi',
   POLL_INTERVAL_SECONDS = '30',
-  DATA_DIR = '/data',              // mount a disk here in prod; use ./data locally
+  DATA_DIR = '/data',
   DEBUG,
-  PORT = process.env.PORT || 3000  // for Railway/Render
+  PORT = process.env.PORT || 3000
 } = process.env;
 
 const dbg = !!DEBUG;
@@ -35,21 +35,21 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const STATE_DIR = path.resolve(DATA_DIR);
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
-if (!fs.existsSync(STATE_FILE)) fs.writeFileSync(
-  STATE_FILE,
-  JSON.stringify({ markets: {}, seeded: false }, null, 2)
-);
+if (!fs.existsSync(STATE_FILE)) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify({ markets: {}, seeded: false }, null, 2));
+}
 
-// Per-market state shape:
+// Per-market state:
 // {
 //   announcedOpen: bool,
 //   announcedClosed: bool,
 //   announcedResolved: bool,
 //   lastStatus: 'open'|'closed'|'resolved'|'unknown',
 //   url: string,
-//   missingCount: number,                // consecutive ticks not present on /Markets
-//   lastSeen: { title, category, endsIn, options },  // live while OPEN
-//   closedSnapshot: { options },         // frozen when we first detect CLOSED
+//   missingCount: number,
+//   lastSeen: { title, category, endsIn, options },
+//   closedSnapshot: { options },
+//   wasTrending: boolean,     // seen in Trending last tick
 // }
 const loadState = () => {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
@@ -78,12 +78,8 @@ function summarizeState(state) {
 }
 
 function getTargetChatId() {
-  try {
-    const st = loadState();
-    return st.targetChatId || TELEGRAM_CHAT_ID;
-  } catch {
-    return TELEGRAM_CHAT_ID;
-  }
+  try { return loadState().targetChatId || TELEGRAM_CHAT_ID; }
+  catch { return TELEGRAM_CHAT_ID; }
 }
 function setTargetChatId(id) {
   const st = loadState();
@@ -161,18 +157,17 @@ function extractIdFromUrl(u) {
   return m ? m[1] : null;
 }
 
-// Scrape OPEN markets from /Markets: always return links; enrich with card data when available
-async function fetchOpenMarketsFromList({ debug = false } = {}) {
+// Section-aware /Markets scraper: returns { trending, active }
+async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
   const listCandidates = [`${base}/Markets`, `${base}/markets`];
 
   for (const url of listCandidates) {
     try {
       const page = await newPage();
-      if (debug || dbg) console.log('[list:cards] goto', url);
+      if (debug || dbg) console.log('[sections] goto', url);
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-      // Wait up to ~20s for any MarketDetails links to appear
       try {
         await page.waitForFunction(
           () => !!document.querySelector('a[href*="MarketDetails?id="], a[href*="/markets/"]'),
@@ -180,58 +175,65 @@ async function fetchOpenMarketsFromList({ debug = false } = {}) {
         );
       } catch {}
 
-      // aggressive scroll to trigger lazy content
       for (let i = 0; i < 10; i++) { await autoScroll(page); await sleep(400); }
 
-      const items = await page.evaluate(() => {
+      const data = await page.evaluate(() => {
         const text = (el) => (el?.textContent || '').trim();
+        const up = (s) => (s || '').toUpperCase();
 
-        // 1) Collect ALL candidate links first
-        const hrefs = Array.from(document.querySelectorAll('a[href]'))
-          .map(a => a.getAttribute('href'))
-          .filter(Boolean)
-          .filter(h => /\/MarketDetails\?id=/.test(h) || /\/markets\//.test(h));
+        const allBlocks = Array.from(document.querySelectorAll('section, div'));
+        const findSectionByHeading = (needle) => {
+          const block = allBlocks.find(b => {
+            const h = b.querySelector('h2, h3, .section-title, .title');
+            return h && up(h.textContent).includes(needle);
+          });
+          return block || document.body;
+        };
 
-        // Dedup + absolutize
-        const absLinks = [];
-        const seen = new Set();
-        for (const h of hrefs) {
-          const abs = h.startsWith('http') ? h : `${location.origin}${h}`;
-          if (!seen.has(abs)) { seen.add(abs); absLinks.push(abs); }
-        }
+        const trendingRoot = findSectionByHeading('TRENDING AURACLES');
+        const activeRoot   = findSectionByHeading('ACTIVE AURACLES');
 
-        // 2) Try to enrich each link with card data (fallback to minimal if no card found)
-        const results = [];
-        for (const abs of absLinks) {
-          // Find a plausible card root near this link
-          const matchSelector = `a[href="${abs.replace(location.origin,'')}"], a[href*="${abs.replace(location.origin,'')}"]`;
-          const a = Array.from(document.querySelectorAll(matchSelector))[0]
-            || Array.from(document.querySelectorAll('a[href*="MarketDetails?id="], a[href*="/markets/"]')).find(x => {
-                 const href = x.getAttribute('href') || '';
-                 const full = href.startsWith('http') ? href : `${location.origin}${href}`;
-                 return full === abs;
-               });
+        const parseCardsWithin = (root) => {
+          const results = [];
+          const anchors = Array.from(root.querySelectorAll('a[href*="MarketDetails?id="], a[href*="/markets/"]'));
+          const seen = new Set();
 
-          let cardRoot = a && (a.closest('article, section, div.card, div') || a.parentElement);
-          let title = '', category = '', endsIn = '', options = [];
+          for (const a of anchors) {
+            const href = a.getAttribute('href') || '';
+            const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
+            if (seen.has(abs)) continue;
+            seen.add(abs);
 
-          if (cardRoot) {
-            // Title
-            title =
-              text(cardRoot.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"]')) ||
-              text(cardRoot.querySelector('strong')) || '';
+            const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
-            // Category badge
-            category =
-              text(cardRoot.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
+            // Scoped title: look near percent rows inside same card
+            const pickTitle = (node) => {
+              if (!node) return '';
+              const pctNode = node.querySelector('[data-testid="option-percent"], .option-percent, .percentage, .percent');
+              let scope = node;
+              if (pctNode) {
+                const block = pctNode.closest('article, section, div');
+                if (block) scope = block;
+              }
+              return (
+                text(scope.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"]')) ||
+                text(scope.querySelector('strong')) || ''
+              );
+            };
 
-            // Ends-in
-            const smalls = Array.from(cardRoot.querySelectorAll('time, .text-xs, .text-sm, [data-testid="ends-in"], .ends-in'))
+            let title =
+              pickTitle(cardRoot) ||
+              text(cardRoot?.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"], strong')) || '';
+
+            const category =
+              text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
+
+            let endsIn = '';
+            const smalls = Array.from(cardRoot?.querySelectorAll('time, .text-xs, .text-sm, [data-testid="ends-in"], .ends-in') || [])
               .map(el => text(el));
             const endsCand = smalls.find(t => /in\b.*(hour|day|minute|about)/i.test(t) || /about/i.test(t));
             if (endsCand) endsIn = endsCand;
 
-            // Options + %
             const rowSelectors = [
               '.option', '.side', '.row',
               '.left, .center, .right',
@@ -250,46 +252,45 @@ async function fetchOpenMarketsFromList({ debug = false } = {}) {
               '[data-testid="option-percent"]'
             ].join(',');
 
-            const rows = Array.from(cardRoot.querySelectorAll(rowSelectors));
+            const options = [];
+            const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
             for (const row of rows) {
               const pctNode = row.querySelector(pctSel);
               const lblNode = row.querySelector(labelSel);
               if (!pctNode || !lblNode) continue;
-              const pctStr = text(pctNode).replace('%','').replace(/[^\d.]/g,'');
+              const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
               const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
               const label = text(lblNode);
               if (!label || pct === null) continue;
               options.push({ label, pct });
               if (options.length >= 3) break;
             }
-          }
 
-          // Extract id
-          let id = null;
-          try {
-            const u = new URL(abs);
-            id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
-          } catch {}
+            let id = null;
+            try {
+              const u = new URL(abs);
+              id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
+            } catch {}
 
-          // Push enriched object if >=2 options; otherwise minimal entry so details scraper can finish it
-          if (options.length >= 2) {
             results.push({ id, url: abs, title, category, endsIn, options, status: 'open' });
-          } else {
-            results.push({ id, url: abs, title: title || '', category: '', endsIn: '', options: [], status: 'open' });
           }
-        }
+          return results;
+        };
 
-        return results;
+        const trending = parseCardsWithin(trendingRoot);
+        const active   = parseCardsWithin(activeRoot);
+
+        return { trending, active };
       });
 
       await page.close();
-      if ((debug || dbg)) console.log('[list:cards] parsed links:', items.length);
-      if (items.length) return items;
+      if (debug || dbg) console.log('[sections] trending:', data.trending.length, 'active:', data.active.length);
+      return data;
     } catch (err) {
-      if (debug || dbg) console.log('[list:cards] error', err.message);
+      if (debug || dbg) console.log('[sections] error', err.message);
     }
   }
-  return [];
+  return { trending: [], active: [] };
 }
 
 // Scrape a MarketDetails page and determine status via explicit Auracle text
@@ -316,7 +317,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       text(document.querySelector('.market-title, h1, h2, [data-testid="market-title"]')) ||
       document.title || '';
 
-    // Explicit status signals
     const pageTextRaw = document.body?.innerText || '';
     const pageTextUP  = pageTextRaw.toUpperCase();
     const isClosedText = pageTextUP.includes('ORACLE CLOSED - AWAITING RESOLUTION');
@@ -327,7 +327,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       winner = resolvedMatch[1].trim();
     }
 
-    // Options as fallback (we mainly trust list for live %)
     const optionRowSelectors = [
       '.option', '.side',
       '.option-a, .option-b, .option-c',
@@ -354,12 +353,9 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       const rows = Array.from(document.querySelectorAll(sel));
       if (rows.length >= 2) {
         options = rows.map((row, i) => {
-          const label =
-            text(row.querySelector(labelSelectors)) ||
-            `Option ${i+1}`;
-          const pct =
-            getPctFromNode(row.querySelector(percentSelectors));
-        return { label, pct: Number.isFinite(pct) ? pct : null };
+          const label = text(row.querySelector(labelSelectors)) || `Option ${i+1}`;
+          const pct = getPctFromNode(row.querySelector(percentSelectors));
+          return { label, pct: Number.isFinite(pct) ? pct : null };
         }).filter(o => o.label || o.pct !== null);
         if (options.length >= 2) break;
       }
@@ -395,18 +391,16 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 // ----------------- MSG TEMPLATES (HTML) -----------------
 function formatOptionsList(options = []) {
   if (!options.length) return '—';
-  const parts = options.map((o) =>
+  return options.map((o) =>
     `${escapeHtml(o.label)}: <b>${o.pct ?? '?' }%</b>`
-  );
-  return parts.join('  |  ');
+  ).join('  |  ');
 }
 function fmtNewMarket(m) {
   const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
   const end = m.endsIn ? `⏳ ${escapeHtml(m.endsIn)}\n` : '';
-  const lines = (m.options || [])
-    .slice(0, 3)
-    .map(o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`)
-    .join('\n');
+  const lines = (m.options || []).slice(0, 3).map(
+    o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`
+  ).join('\n');
 
   return [
     '🔥 <b>New Market Live on Auracle</b>',
@@ -434,6 +428,18 @@ function fmtResolved(m) {
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
+function fmtTrending(m) {
+  const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
+  const lines = (m.options || []).slice(0,3).map(
+    o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`
+  ).join('\n');
+  return [
+    '📈 <b>Now Trending on Auracle</b>',
+    `🏟️ <b>${escapeHtml(m.title)}</b>`,
+    cat + (lines || ''),
+    `🔗 ${escapeHtml(m.url)}`
+  ].join('\n');
+}
 
 // ----------------- TELEGRAM SEND (HTML) -----------------
 async function send(msg, tag = '') {
@@ -455,55 +461,61 @@ async function tick() {
   try {
     if (dbg) console.log('[tick] run at', new Date().toISOString());
 
-    // 1) Get current OPEN markets as rich cards (links guaranteed)
-    const listCards = await fetchOpenMarketsFromList({ debug: dbg });
-    const listIds = new Set(listCards.map(m => m.id).filter(Boolean));
+    // 1) Read sections
+    const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
 
-    // 2) Watch set = currently open ∪ previously known
+    const activeIds   = new Set(active.map(m => m.id).filter(Boolean));
+    const trendingIds = new Set(trending.map(m => m.id).filter(Boolean));
+
     let state = loadState();
     if (!state || !state.markets) state = { markets: {}, seeded: false };
     const knownIds = new Set(Object.keys(state.markets));
-    const toWatch = new Set([...listIds, ...knownIds]);
+    const toWatch = new Set([...activeIds, ...knownIds]); // don't treat trending as new-open
 
-    if (dbg) console.log('[tick] list(open):', listIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
+    if (dbg) console.log('[tick] active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
 
-    // Fast lookup for card info
-    const cardById = new Map(listCards.map(m => [m.id, m]));
+    const activeById   = new Map(active.map(m => [m.id, m]));
+    const trendingById = new Map(trending.map(m => [m.id, m]));
 
-    // 3) Scrape details for all watched IDs
+    // 2) Scrape details for watched IDs
     const base = AURACLE_BASE_URL.replace(/\/+$/, '');
     const results = [];
     for (const id of toWatch) {
       const known = state.markets[id];
-      const url = known?.url || cardById.get(id)?.url || `${base}/MarketDetails?id=${id}`;
-      const m = await scrapeMarketDetail(url, { debug: dbg });
-      if (!m || !m.id) continue;
+      const url =
+        known?.url ||
+        activeById.get(id)?.url ||
+        trendingById.get(id)?.url ||
+        `${base}/MarketDetails?id=${id}`;
 
-      // Merge richer list info when OPEN
-      if (m.status === 'open' && cardById.has(m.id)) {
-        const card = cardById.get(m.id);
-        m.category = card.category || m.category;
-        m.endsIn   = card.endsIn   || m.endsIn;
-        if (Array.isArray(card.options) && card.options.length >= 2) {
-          m.options = card.options;
-        }
+      const detail = await scrapeMarketDetail(url, { debug: dbg });
+      if (!detail || !detail.id) continue;
+
+      // Merge richer list data when OPEN (prefer Active card)
+      if (detail.status === 'open' && activeById.has(detail.id)) {
+        const card = activeById.get(detail.id);
+        detail.category = card.category || detail.category;
+        detail.endsIn   = card.endsIn   || detail.endsIn;
+        if (Array.isArray(card.options) && card.options.length >= 2) detail.options = card.options;
       }
 
-      results.push(m);
+      results.push(detail);
     }
 
-    // 4) Cold-start seeding (avoid first-run spam)
+    // 3) Seed on first run (avoid spam)
     if (!state.seeded && results.length) {
       if (dbg) console.log('[seed] first run — seeding', results.length, 'markets');
       for (const m of results) {
-        const card = cardById.get(m.id);
+        const inActive   = activeById.has(m.id);
+        const card       = activeById.get(m.id) || trendingById.get(m.id);
         state.markets[m.id] = {
-          announcedOpen:     m.status === 'open',
+          announcedOpen:     m.status === 'open' && inActive, // only mark open if listed in Active
           announcedClosed:   m.status === 'closed',
           announcedResolved: m.status === 'resolved',
           lastStatus:        m.status,
           url:               m.url,
           missingCount:      0,
+          wasTrending:       trendingIds.has(m.id),
           lastSeen:          card ? { title: m.title, category: card.category, endsIn: card.endsIn, options: card.options } :
                                     { title: m.title, category: m.category, endsIn: m.endsIn, options: m.options },
           closedSnapshot:    m.status === 'closed' ? { options: (m.options || []) } : null
@@ -517,81 +529,98 @@ async function tick() {
 
     if (dbg) console.log('[tick] scraped details:', results.length);
 
-    // 5) Update missingCount
+    // 4) Update missingCount vs Active ids
     for (const id of Object.keys(state.markets)) {
-      const wasOnList = listIds.has(id);
-      state.markets[id].missingCount = wasOnList ? 0 : ((state.markets[id].missingCount || 0) + 1);
+      state.markets[id].missingCount = activeIds.has(id) ? 0 : ((state.markets[id].missingCount || 0) + 1);
     }
 
-    // 6) Announce transitions, manage snapshots
+    // 5) Transitions + announcements
     for (const m of results) {
       const prev = state.markets[m.id] || {
         announcedOpen: false, announcedClosed: false, announcedResolved: false,
-        lastStatus: 'unknown', url: m.url, missingCount: 0, lastSeen: null, closedSnapshot: null
+        lastStatus: 'unknown', url: m.url, missingCount: 0, lastSeen: null, closedSnapshot: null, wasTrending: false
       };
       const next = { ...prev, url: m.url };
-      let posted = false;
 
-      // While OPEN, keep updating lastSeen with freshest card data
+      // Keep lastSeen fresh while OPEN (prefer Active card)
       if (m.status === 'open') {
-        const card = cardById.get(m.id);
+        const card = activeById.get(m.id) || trendingById.get(m.id);
         const seenOpts = card?.options?.length ? card.options : m.options;
         next.lastSeen = {
-          title: m.title,
+          title: m.title, // truth-source from detail page title to avoid duplicates
           category: card?.category ?? m.category,
           endsIn: card?.endsIn ?? m.endsIn,
           options: Array.isArray(seenOpts) ? seenOpts : (prev.lastSeen?.options || [])
         };
       }
 
-      // Infer CLOSED if disappeared from list for >=2 ticks but detail still says open
-      if (!listIds.has(m.id) && (prev.missingCount || 0) >= 1 && m.status === 'open') {
-        if (dbg) console.log('[infer] CLOSED due to disappearance:', m.id);
+      // Infer CLOSED if gone from Active for >=2 ticks but detail says open
+      if (!activeIds.has(m.id) && (prev.missingCount || 0) >= 1 && m.status === 'open') {
+        if (dbg) console.log('[infer] CLOSED due to disappearance from Active:', m.id);
         m.status = 'closed';
       }
 
-      // On first CLOSED, snapshot final pool options if not already
+      // On first CLOSED, snapshot final pool options
       if (m.status === 'closed' && !next.closedSnapshot) {
         const finalOpts = (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || [];
         next.closedSnapshot = { options: finalOpts };
       }
 
-      // ---- Announcements
-      if (m.status === 'open' && !prev.announcedOpen) {
+      // ---- OPEN (only from Active section) ----
+      if (m.status === 'open' && activeIds.has(m.id) && !prev.announcedOpen) {
+        const card = activeById.get(m.id);
         const openPayload = {
           ...m,
-          category: next.lastSeen?.category ?? m.category,
-          endsIn: next.lastSeen?.endsIn ?? m.endsIn,
-          options: next.lastSeen?.options?.length ? next.lastSeen.options : m.options
+          title: m.title || prev.lastSeen?.title || card?.title || 'Unknown',
+          category: next.lastSeen?.category ?? card?.category ?? m.category,
+          endsIn: next.lastSeen?.endsIn ?? card?.endsIn ?? m.endsIn,
+          options: (card?.options?.length ? card.options :
+                    next.lastSeen?.options?.length ? next.lastSeen.options :
+                    m.options)
         };
         await send(fmtNewMarket(openPayload), 'OPEN');
-        next.announcedOpen = true; posted = true;
+        next.announcedOpen = true;
       }
 
+      // ---- CLOSED ----
       if (m.status === 'closed' && !prev.announcedClosed) {
         const closedOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
             : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);
-        const closedPayload = { ...m, options: closedOptions };
+        const closedPayload = { ...m, options: closedOptions, title: m.title || prev.lastSeen?.title || 'Unknown' };
         await send(fmtClosed(closedPayload), 'CLOSED');
-        next.announcedClosed = true; posted = true;
+        next.announcedClosed = true;
       }
 
+      // ---- RESOLVED ----
       if (m.status === 'resolved' && !prev.announcedResolved) {
         const finalOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
             : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);
-        const resolvedPayload = { ...m, options: finalOptions };
+        const resolvedPayload = { ...m, options: finalOptions, title: m.title || prev.lastSeen?.title || 'Unknown' };
         await send(fmtResolved(resolvedPayload), 'RESOLVED');
-        next.announcedResolved = true; posted = true;
+        next.announcedResolved = true;
       }
+
+      // ---- TRENDING transition ----
+      const isTrendingNow = trendingIds.has(m.id);
+      const wasTrendingBefore = !!prev.wasTrending;
+      if (isTrendingNow && !wasTrendingBefore) {
+        const card = activeById.get(m.id) || trendingById.get(m.id);
+        const payload = {
+          ...m,
+          title: m.title || card?.title || prev.lastSeen?.title || 'Unknown',
+          category: card?.category ?? m.category,
+          options: (card?.options?.length ? card.options :
+                    prev.lastSeen?.options?.length ? prev.lastSeen.options :
+                    m.options) || []
+        };
+        await send(fmtTrending(payload), 'TRENDING');
+      }
+      next.wasTrending = isTrendingNow;
 
       next.lastStatus = m.status;
       state.markets[m.id] = next;
-
-      if (dbg && !posted && prev.lastStatus !== m.status) {
-        console.log('[info] status changed but announce flags already set:', m.id, prev.lastStatus, '→', m.status);
-      }
     }
 
     saveState(state);
@@ -606,14 +635,10 @@ bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
 
 bot.command('health', async (ctx) => {
   try {
-    const cards = await fetchOpenMarketsFromList({ debug: true });
-    const n = cards.length;
-    if (!n) return void ctx.reply('Found 0 MarketDetails links on /Markets (after full scroll).');
-    const sample = cards.slice(0, 3).map(c => {
-      const pct = (c.options||[]).map(o=>o.pct+'%').join('/') || 'no % parsed';
-      return `${c.title || '(no title)'} (${pct})`;
-    }).join(' | ');
-    await ctx.reply(`Open markets detected: ${n}\nSample: ${sample}`);
+    const { trending, active } = await fetchMarketsFromSections({ debug: true });
+    const sampleA = active.slice(0,2).map(c => c.title || '(no title)').join(' | ') || '—';
+    const sampleT = trending.slice(0,2).map(c => c.title || '(no title)').join(' | ') || '—';
+    await ctx.reply(`Active: ${active.length}  |  Trending: ${trending.length}\nActive sample: ${sampleA}\nTrending sample: ${sampleT}`);
   } catch (e) {
     await ctx.reply(`Fetch failed: ${String(e.message || e).slice(0, 300)}`);
   }
@@ -634,22 +659,33 @@ bot.command('set_target', async (ctx) => {
   await ctx.reply(`OK. Target chat set to: ${id}`);
 });
 
+// Force announce from Active list, with detail-title correction
 bot.command('announce_open_now', async (ctx) => {
   const parts = (ctx.message.text || '').trim().split(/\s+/);
   const limit = Math.max(1, Math.min(parseInt(parts[1] || '3', 10) || 3, 20));
 
-  const cards = await fetchOpenMarketsFromList({ debug: false });
+  const { active } = await fetchMarketsFromSections({ debug: false });
   let count = 0;
-  for (const m of cards.slice(0, limit)) {
-    await send(fmtNewMarket(m), 'OPEN(TEST)');
+  for (const card of active.slice(0, limit)) {
+    // Pull detail to truth-source the title
+    const detail = await scrapeMarketDetail(card.url, { debug: dbg });
+    const merged = {
+      ...card,
+      id: card.id || detail?.id,
+      url: detail?.url || card.url,
+      title: (detail?.title || card.title || 'Unknown').toUpperCase(),
+      options: (card.options?.length ? card.options : detail?.options || [])
+    };
+    await send(fmtNewMarket(merged), 'OPEN(TEST)');
     const st = loadState();
-    st.markets[m.id] = {
-      ...(st.markets[m.id] || {}),
+    st.markets[merged.id] = {
+      ...(st.markets[merged.id] || {}),
       announcedOpen: true,
       lastStatus: 'open',
-      url: m.url,
+      url: merged.url,
       missingCount: 0,
-      lastSeen: { title: m.title, category: m.category, endsIn: m.endsIn, options: m.options }
+      wasTrending: false,
+      lastSeen: { title: merged.title, category: merged.category, endsIn: merged.endsIn, options: merged.options }
     };
     saveState(st);
     count++;
@@ -681,15 +717,15 @@ bot.launch().then(async () => {
   try {
     await bot.telegram.setMyCommands([
       { command: 'ping', description: 'Ping the bot' },
-      { command: 'health', description: 'List count & sample from /Markets' },
+      { command: 'health', description: 'Active/Trending counts' },
       { command: 'whereami', description: 'Show current & target chat' },
       { command: 'set_target', description: 'Set target chat id or "here"' },
-      { command: 'announce_open_now', description: 'Announce N open markets now' },
+      { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
       { command: 'state', description: 'Show tracked/announced counts' },
     ]);
   } catch {}
   const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30);
-  tick(); // immediate run
+  tick(); // run immediately
   cron.schedule(`*/${interval} * * * * *`, tick);
 });
 

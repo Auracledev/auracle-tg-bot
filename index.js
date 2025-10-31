@@ -40,7 +40,6 @@ if (!fs.existsSync(STATE_FILE)) {
   fs.writeFileSync(STATE_FILE, JSON.stringify({ markets: {}, seeded: false }, null, 2));
 }
 
-// Per-market state structure noted previously
 const loadState = () => {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
   catch { return { markets: {}, seeded: false }; }
@@ -66,7 +65,6 @@ function summarizeState(state) {
     targetChatId: state.targetChatId || TELEGRAM_CHAT_ID
   };
 }
-
 function getTargetChatId() {
   try { return loadState().targetChatId || TELEGRAM_CHAT_ID; }
   catch { return TELEGRAM_CHAT_ID; }
@@ -108,7 +106,6 @@ async function getBrowser() {
   console.log('[puppeteer] launched');
   return browser;
 }
-
 async function newPage() {
   const b = await getBrowser();
   const page = await b.newPage();
@@ -117,7 +114,6 @@ async function newPage() {
   await page.setCacheEnabled(false); // disable disk/mem cache
   return page;
 }
-
 async function autoScroll(page) {
   await page.evaluate(async () => {
     await new Promise((resolve) => {
@@ -148,10 +144,7 @@ function extractIdFromUrl(u) {
   return m ? m[1] : null;
 }
 
-/**
- * HOT badge → Trending, else Active. Only ID/URL + light meta (no titles).
- * Adds cache-buster to defeat edge caching.
- */
+// List-page parser: HOT badge => trending; otherwise active. (No titles.)
 async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
   const now = Date.now();
@@ -247,7 +240,6 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           entries.push({ entry, trending });
         }
 
-        // Dedup by ID/URL
         const byKey = new Map();
         for (const { entry, trending } of entries) {
           const key = entry.id || entry.url;
@@ -275,7 +267,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
   return { trending: [], active: [] };
 }
 
-// --------- DETAIL SCRAPER (robust title) ----------
+// Detail page with robust title + status detection
 async function scrapeMarketDetail(url, { debug = false } = {}) {
   const page = await newPage();
   if (debug || dbg) console.log('[detail] goto', url);
@@ -752,39 +744,51 @@ bot.command('reseed_off', async (ctx) => {
   await ctx.reply('Seeding disabled (seeded=true).');
 });
 
-// ----------------- START -----------------
-bot.launch().then(async () => {
-  console.log('Bot started.');
-  try {
-    await bot.telegram.setMyCommands([
-      { command: 'ping', description: 'Ping the bot' },
-      { command: 'health', description: 'Active/Trending counts (titles from details)' },
-      { command: 'whereami', description: 'Show current & target chat' },
-      { command: 'set_target', description: 'Set target chat id or "here"' },
-      { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
-      { command: 'tick_now', description: 'Run a tick immediately' },
-      { command: 'state', description: 'Show tracked/announced counts' },
-    ]);
-  } catch {}
+// ----------------- BOOT + SCHEDULERS -----------------
+async function setupSchedules() {
   const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30);
   console.log(`[cron] scheduling tick every ${interval}s (TZ=${TZ})`);
 
   // immediate tick
   tick();
 
-  // node-cron schedule (seconds field enabled)
+  // node-cron (seconds field)
   const expr = `*/${interval} * * * * *`;
   cron.schedule(expr, () => {
     console.log(`[cron] tick firing @ ${new Date().toISOString()} via node-cron (${expr})`);
     tick();
   }, { timezone: TZ });
 
-  // fallback safety: setInterval (in case cron is blocked in the env)
+  // fallback safety: setInterval
   setInterval(() => {
     console.log(`[cron-fallback] tick firing @ ${new Date().toISOString()} every ${interval}s`);
     tick();
   }, interval * 1000);
-});
+}
+
+// launch bot + ALWAYS call setupSchedules (IIFE so it runs in all envs)
+(async () => {
+  try {
+    await bot.launch();
+    console.log('Bot started.');
+  } catch (e) {
+    console.error('bot.launch error:', e);
+  } finally {
+    // even if launch throws, still arm schedulers so we see logs
+    setupSchedules();
+    try {
+      await bot.telegram.setMyCommands([
+        { command: 'ping', description: 'Ping the bot' },
+        { command: 'health', description: 'Active/Trending counts (titles from details)' },
+        { command: 'whereami', description: 'Show current & target chat' },
+        { command: 'set_target', description: 'Set target chat id or "here"' },
+        { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
+        { command: 'tick_now', description: 'Run a tick immediately' },
+        { command: 'state', description: 'Show tracked/announced counts' },
+      ]);
+    } catch {}
+  }
+})();
 
 // ----------------- TINY HTTP SERVER -----------------
 const server = http.createServer(async (req, res) => {
@@ -800,6 +804,8 @@ const server = http.createServer(async (req, res) => {
 });
 server.listen(PORT, () => console.log(`[http] listening on :${PORT}`));
 
-// ----------------- GRACEFUL SHUTDOWN -----------------
+// ----------------- GRACEFUL SHUTDOWN + ERR LOGS -----------------
 process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });
 process.once('SIGTERM', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGTERM'); server.close(); });
+process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));

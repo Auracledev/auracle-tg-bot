@@ -18,7 +18,8 @@ const {
   POLL_INTERVAL_SECONDS = '30',
   DATA_DIR = '/data',
   DEBUG,
-  PORT = process.env.PORT || 3000
+  PORT = process.env.PORT || 3000,
+  TZ = process.env.TZ || 'UTC'
 } = process.env;
 
 const dbg = !!DEBUG;
@@ -39,18 +40,7 @@ if (!fs.existsSync(STATE_FILE)) {
   fs.writeFileSync(STATE_FILE, JSON.stringify({ markets: {}, seeded: false }, null, 2));
 }
 
-// Per-market state:
-// {
-//   announcedOpen: bool,
-//   announcedClosed: bool,
-//   announcedResolved: bool,
-//   lastStatus: 'open'|'closed'|'resolved'|'unknown',
-//   url: string,
-//   missingCount: number,
-//   lastSeen: { title, category, endsIn, options },
-//   closedSnapshot: { options },
-//   wasTrending: boolean,
-// }
+// Per-market state structure noted previously
 const loadState = () => {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
   catch { return { markets: {}, seeded: false }; }
@@ -115,7 +105,7 @@ async function getBrowser() {
       '--window-size=1280,1024',
     ],
   });
-  if (dbg) console.log('[puppeteer] launched');
+  console.log('[puppeteer] launched');
   return browser;
 }
 
@@ -124,6 +114,7 @@ async function newPage() {
   const page = await b.newPage();
   await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) AuracleBot/1.0 Chrome/117 Safari/537.36');
   await page.setViewport({ width: 1280, height: 1024 });
+  await page.setCacheEnabled(false); // disable disk/mem cache
   return page;
 }
 
@@ -158,12 +149,13 @@ function extractIdFromUrl(u) {
 }
 
 /**
- * Classify list cards with HOT badge → Trending, else Active.
- * Only return id/url and light meta (no titles).
+ * HOT badge → Trending, else Active. Only ID/URL + light meta (no titles).
+ * Adds cache-buster to defeat edge caching.
  */
 async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
-  const listCandidates = [`${base}/Markets`, `${base}/markets`];
+  const now = Date.now();
+  const listCandidates = [`${base}/Markets?ts=${now}`, `${base}/markets?ts=${now}`];
 
   for (const url of listCandidates) {
     try {
@@ -297,10 +289,8 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     const text = (el) => (el?.textContent || '').trim();
     const up = (s) => (s || '').toUpperCase();
 
-    // 1) Prefer OpenGraph
     const og = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
 
-    // 2) Visible heading candidates
     const nodes = Array.from(document.querySelectorAll(
       'h1, h2, h3, .market-title, [data-testid="market-title"], .title, .text-3xl, .text-2xl'
     ));
@@ -310,14 +300,12 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       if (!s) return -1e9;
       let t = s.replace(/\s+/g, ' ').trim();
       if (bad.test(t)) return -1e9;
-      // downweight generic page titles
       if (/AURACLE\s*(•|-|—|\|)/i.test(t)) return -1000;
-
       let score = 0;
       if (/\bvs\b/i.test(t)) score += 50;
       if (/\?/.test(t)) score += 30;
       if (t.length >= 12) score += 10;
-      score += Math.min(60, t.length / 2); // prefer longer, capped
+      score += Math.min(60, t.length / 2);
       return score;
     };
 
@@ -329,7 +317,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       cand.push({ t, s: scoreTitle(t) });
     }
 
-    // If we see percentage boxes, try to grab heading in same block
     const pct = document.querySelector('[data-testid="option-percent"], .option-percent, .percentage, .percent');
     if (pct) {
       const blk = pct.closest('article, section, div');
@@ -345,10 +332,8 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     cand.sort((a, b) => b.s - a.s);
     let bestTitle = (cand.find(x => x.s > 0)?.t || '').trim();
 
-    // 3) Last resort: strip site name from tab title
     if (!bestTitle) {
       let dt = (document.title || '').trim();
-      // split on common separators and drop site name chunks
       let parts = dt.split(/[\|\-•—]/).map(s => s.trim()).filter(Boolean);
       parts = parts.filter(p => !/^AURACLE$/i.test(p));
       bestTitle = parts[0] || dt;
@@ -356,7 +341,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 
     const getPctFromNode = (node) => {
       if (!node) return null;
-      const s = text(node).replace('%','').replace(/[^\d.]/g,'');
+      const s = (node?.textContent || '').replace('%','').replace(/[^\d.]/g,'');
       const n = parseFloat(s);
       return Number.isFinite(n) ? Math.round(n) : null;
     };
@@ -395,7 +380,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       const rows = Array.from(document.querySelectorAll(sel));
       if (rows.length >= 2) {
         options = rows.map((row, i) => {
-          const label = text(row.querySelector(labelSelectors)) || `Option ${i+1}`;
+          const label = (row.querySelector(labelSelectors)?.textContent || '').trim() || `Option ${i+1}`;
           const pct = getPctFromNode(row.querySelector(percentSelectors));
           return { label, pct: Number.isFinite(pct) ? Math.round(pct) : null };
         }).filter(o => o.label || o.pct !== null);
@@ -501,7 +486,7 @@ async function send(msg, tag = '') {
 // ----------------- TICK LOOP -----------------
 async function tick() {
   try {
-    if (dbg) console.log('[tick] run at', new Date().toISOString());
+    console.log('[tick] run at', new Date().toISOString());
 
     const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
 
@@ -511,9 +496,9 @@ async function tick() {
     let state = loadState();
     if (!state || !state.markets) state = { markets: {}, seeded: false };
     const knownIds = new Set(Object.keys(state.markets));
-    const toWatch = new Set([...activeIds, ...knownIds]);
+    const toWatch = new Set([...activeIds, ...knownIds]); // announce open only if in Active
 
-    if (dbg) console.log('[tick] active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
+    console.log('[tick] counts → active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
 
     const activeById   = new Map(active.map(m => [m.id, m]));
     const trendingById = new Map(trending.map(m => [m.id, m]));
@@ -544,7 +529,7 @@ async function tick() {
     }
 
     if (!state.seeded && results.length) {
-      if (dbg) console.log('[seed] first run — seeding', results.length, 'markets');
+      console.log('[seed] first run — seeding', results.length, 'markets');
       for (const m of results) {
         const inActive   = activeById.has(m.id);
         const card       = activeById.get(m.id) || trendingById.get(m.id);
@@ -563,11 +548,11 @@ async function tick() {
       }
       state.seeded = true;
       saveState(state);
-      if (dbg) console.log('[seed] done');
+      console.log('[seed] done');
       return;
     }
 
-    if (dbg) console.log('[tick] scraped details:', results.length);
+    console.log('[tick] scraped detail count:', results.length);
 
     for (const id of Object.keys(state.markets)) {
       state.markets[id].missingCount = activeIds.has(id) ? 0 : ((state.markets[id].missingCount || 0) + 1);
@@ -592,7 +577,7 @@ async function tick() {
       }
 
       if (!activeIds.has(m.id) && (prev.missingCount || 0) >= 1 && m.status === 'open') {
-        if (dbg) console.log('[infer] CLOSED due to disappearance from Active:', m.id);
+        console.log('[infer] CLOSED due to disappearance from Active:', m.id);
         m.status = 'closed';
       }
 
@@ -655,7 +640,7 @@ async function tick() {
     }
 
     saveState(state);
-    if (dbg) console.log('[tick] done.', summarizeState(state));
+    console.log('[tick] done', summarizeState(state));
   } catch (e) {
     console.error('tick error:', e.message);
   }
@@ -738,6 +723,17 @@ bot.command('announce_open_now', async (ctx) => {
   await ctx.reply(`Announced ${count} open market(s) to target chat.`);
 });
 
+// Manual tick trigger
+bot.command('tick_now', async (ctx) => {
+  try {
+    await ctx.reply('Tick started…');
+    await tick();
+    await ctx.reply('Tick finished.');
+  } catch (e) {
+    await ctx.reply(`Tick error: ${e.message || e}`);
+  }
+});
+
 bot.command('state', async (ctx) => {
   try {
     const s = summarizeState(loadState());
@@ -766,12 +762,28 @@ bot.launch().then(async () => {
       { command: 'whereami', description: 'Show current & target chat' },
       { command: 'set_target', description: 'Set target chat id or "here"' },
       { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
+      { command: 'tick_now', description: 'Run a tick immediately' },
       { command: 'state', description: 'Show tracked/announced counts' },
     ]);
   } catch {}
   const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30);
-  tick(); // run immediately
-  cron.schedule(`*/${interval} * * * * *`, tick);
+  console.log(`[cron] scheduling tick every ${interval}s (TZ=${TZ})`);
+
+  // immediate tick
+  tick();
+
+  // node-cron schedule (seconds field enabled)
+  const expr = `*/${interval} * * * * *`;
+  cron.schedule(expr, () => {
+    console.log(`[cron] tick firing @ ${new Date().toISOString()} via node-cron (${expr})`);
+    tick();
+  }, { timezone: TZ });
+
+  // fallback safety: setInterval (in case cron is blocked in the env)
+  setInterval(() => {
+    console.log(`[cron-fallback] tick firing @ ${new Date().toISOString()} every ${interval}s`);
+    tick();
+  }, interval * 1000);
 });
 
 // ----------------- TINY HTTP SERVER -----------------
@@ -780,7 +792,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const st = loadState();
     const sum = summarizeState(st);
-    res.end(JSON.stringify({ ok: true, ...sum }));
+    res.end(JSON.stringify({ ok: true, ...sum, now: new Date().toISOString() }));
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' });

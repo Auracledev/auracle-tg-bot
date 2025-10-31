@@ -1,34 +1,33 @@
 import 'dotenv/config';
-import fetch from 'node-fetch';
 import * as fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Telegraf } from 'telegraf';
 import cron from 'node-cron';
-import cheerio from 'cheerio';
+import { Telegraf } from 'telegraf';
+import puppeteer from 'puppeteer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---- ENV ----
+// ----------------- ENV -----------------
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   AURACLE_BASE_URL = 'https://auracle.fi',
   POLL_INTERVAL_SECONDS = '30',
-  DATA_DIR = path.resolve(__dirname, 'data'),
+  DATA_DIR = '/data', // Railway volume (Storage -> Add Volume -> mount at /data)
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-  console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+  console.error('Missing env vars: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID');
   process.exit(1);
 }
 
-// ---- TELEGRAM ----
+// ----------------- TELEGRAM -----------------
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// ---- STATE (persistent) ----
-const STATE_DIR = DATA_DIR;
+// ----------------- STATE (persistent) -----------------
+const STATE_DIR = path.resolve(DATA_DIR);
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
 if (!fs.existsSync(STATE_FILE)) fs.writeFileSync(STATE_FILE, JSON.stringify({ markets: {} }, null, 2));
@@ -36,172 +35,326 @@ if (!fs.existsSync(STATE_FILE)) fs.writeFileSync(STATE_FILE, JSON.stringify({ ma
 const loadState = () => JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
 const saveState = (s) => fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
 
-// ---- SCRAPER ----
-// Goal shape:
-/*
-[
-  {
-    id: "market_123",
-    title: "Lakers vs Bucks",
-    url: "https://auracle.fi/markets/market_123",
-    status: "open" | "closed" | "resolved",
-    percentages: { aLabel:"A", aPct:63, bLabel:"B", bPct:37 } | null,
-    winner: "Lakers" | "Bucks" | null
-  }
-]
-*/
-async function fetchMarkets() {
-  // Load markets index page
-  const res = await fetch(`${AURACLE_BASE_URL}/markets`, { headers: { 'user-agent': 'AuracleBot/1.0 (+telegram)' }});
-  if (!res.ok) throw new Error(`Markets page HTTP ${res.status}`);
-  const html = await res.text();
-  const $ = cheerio.load(html);
+// ----------------- PUPPETEER (singleton) -----------------
+let browser = null;
 
-  // NOTE: Update selectors to match auracle.fi DOM.
-  // The below is a safe starting point with common class names.
-  const markets = [];
-  const cards = $('.market-card, [data-market-id], .card-market');
-
-  cards.each((_, el) => {
-    const $el = $(el);
-
-    // ID: prefer data attr, fall back to href slug
-    const dataId = $el.attr('data-id') || $el.attr('data-market-id');
-    const href = $el.find('a[href*="/markets/"]').attr('href') || '';
-    let id = dataId;
-    if (!id && href) {
-      const m = href.match(/\/markets\/([^/?#]+)/i);
-      if (m) id = m[1];
-    }
-
-    // URL
-    const url = href ? (href.startsWith('http') ? href : `${AURACLE_BASE_URL}${href}`) : null;
-
-    // Title
-    const title = (
-      $el.find('.market-title,h3,h2').first().text().trim() ||
-      $el.find('a[href*="/markets/"]').first().text().trim()
-    );
-
-    // Status text (normalize)
-    let statusTxt = (
-      $el.find('.market-status,.status,.badge-status').first().text().trim().toLowerCase()
-    );
-    // Try to infer if missing
-    if (!statusTxt) {
-      // heuristics: look for "open/close/resolved" badges or countdowns
-      if ($el.text().toLowerCase().includes('resolved')) statusTxt = 'resolved';
-      else if ($el.text().toLowerCase().includes('closed')) statusTxt = 'closed';
-      else statusTxt = 'open';
-    }
-    const status = (statusTxt.includes('resolve') ? 'resolved'
-                   : statusTxt.includes('close') ? 'closed'
-                   : 'open');
-
-    // Percentages (present when closed/resolved)
-    let aLabel = $el.find('.side-a .label,.option-a .label,.left .label').first().text().trim();
-    let bLabel = $el.find('.side-b .label,.option-b .label,.right .label').first().text().trim();
-    let aPctTxt = $el.find('.side-a .percent,.option-a .percent,.left .percent').first().text().replace('%','').trim();
-    let bPctTxt = $el.find('.side-b .percent,.option-b .percent,.right .percent').first().text().replace('%','').trim();
-
-    // Try alt selectors if empty:
-    if (!aPctTxt && !bPctTxt) {
-      const percents = $el.find('.percent,.percentage,.progress-label').map((_, p) => $(p).text().replace('%','').trim()).get();
-      if (percents.length >= 2) {
-        aPctTxt = percents[0];
-        bPctTxt = percents[1];
-      }
-    }
-    if (!aLabel && !bLabel) {
-      const labels = $el.find('.label,.name,.team').map((_, p) => $(p).text().trim()).get();
-      if (labels.length >= 2) {
-        aLabel = labels[0]; bLabel = labels[1];
-      }
-    }
-
-    let percentages = null;
-    if (status !== 'open') {
-      const aPct = Number.isFinite(parseFloat(aPctTxt)) ? Math.round(parseFloat(aPctTxt)) : null;
-      const bPct = Number.isFinite(parseFloat(bPctTxt)) ? Math.round(parseFloat(bPctTxt)) : (aPct !== null ? 100 - aPct : null);
-      percentages = { aLabel: aLabel || 'Side A', aPct, bLabel: bLabel || 'Side B', bPct };
-    }
-
-    // Winner (only when resolved)
-    let winner = null;
-    if (status === 'resolved') {
-      winner = (
-        $el.find('.winner .name,.winner,.result-winner').first().text().trim() || null
-      );
-      // If still null, infer by badge or CSS class
-      if (!winner) {
-        const winnerA = $el.find('.side-a,.option-a').first().hasClass('winner');
-        const winnerB = $el.find('.side-b,.option-b').first().hasClass('winner');
-        if (winnerA) winner = aLabel || 'Side A';
-        if (winnerB) winner = bLabel || 'Side B';
-      }
-    }
-
-    if (id && title && url) {
-      markets.push({ id, title, url, status, percentages, winner });
-    }
+async function getBrowser() {
+  if (browser) return browser;
+  browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
-
-  return markets;
+  return browser;
 }
 
-// ---- MESSAGE TEMPLATES ----
+async function newPage() {
+  const b = await getBrowser();
+  const page = await b.newPage();
+  await page.setUserAgent('AuracleBot/1.0 (+Telegram)');
+  await page.setViewport({ width: 1280, height: 1024 });
+  return page;
+}
+
+async function autoScroll(page) {
+  // Scroll to bottom to trigger lazy/virtualized lists
+  await page.evaluate(async () => {
+    await new Promise((resolve) => {
+      let total = 0;
+      const distance = 800;
+      const timer = setInterval(() => {
+        const { scrollTop, scrollHeight, clientHeight } = document.scrollingElement || document.documentElement;
+        window.scrollBy(0, distance);
+        total += distance;
+        if (scrollTop + clientHeight >= scrollHeight - 2 || total > 20000) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, 250);
+    });
+  });
+}
+
+// ----------------- SCRAPER -----------------
+/**
+ * Normalized market shape:
+ * {
+ *   id: string,
+ *   title: string,
+ *   url: string,
+ *   status: "open" | "closed" | "resolved",
+ *   options: Array<{ label: string, pct: number|null }>,   // 2 or 3 (e.g., includes "Draw")
+ *   winner: string|null                                     // label of winning option when resolved
+ * }
+ */
+async function fetchMarkets() {
+  // try /markets first, then /Markets (in case of capitalized route)
+  const base = AURACLE_BASE_URL.replace(/\/+$/, '');
+  const candidates = [`${base}/markets`, `${base}/Markets`];
+
+  for (const url of candidates) {
+    try {
+      const page = await newPage();
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+
+      // Wait for any likely container; tolerate different classnames
+      const readySelectors = [
+        '.market-card',
+        '[data-market-id]',
+        '.card-market',
+        'a[href*="/markets/"]',
+        'a[href*="/MarketDetails"]',
+      ];
+      let ready = false;
+      for (const sel of readySelectors) {
+        try {
+          await page.waitForSelector(sel, { timeout: 8000 });
+          ready = true;
+          break;
+        } catch { /* keep looping */ }
+      }
+
+      if (!ready) {
+        // Try scroll + wait again (virtualized content)
+        await autoScroll(page);
+        for (const sel of readySelectors) {
+          try {
+            await page.waitForSelector(sel, { timeout: 4000 });
+            ready = true;
+            break;
+          } catch { /* keep looping */ }
+        }
+      }
+
+      if (!ready) {
+        await page.close();
+        continue; // try next candidate URL
+      }
+
+      // Ensure content is fully loaded
+      await autoScroll(page);
+
+      const markets = await page.evaluate(() => {
+        const text = (el) => (el?.textContent || '').trim();
+        const getPct = (node) => {
+          const s = text(node).replace('%', '').replace(/[^\d.]/g, '');
+          const n = parseFloat(s);
+          return Number.isFinite(n) ? Math.round(n) : null;
+        };
+
+        // Common lists of option containers (A/B[/C]) we might see
+        const optionRowSelectors = [
+          '.option',                // generic
+          '.side',                  // side-a / side-b / side-c
+          '.option-a, .option-b, .option-c',
+          '.side-a, .side-b, .side-c',
+          '.left, .right, .center', // layout-based
+        ];
+
+        // Gather card elements OR fallback to links
+        const cardNodes = Array.from(document.querySelectorAll('.market-card, [data-market-id], .card-market'));
+        const linkNodes = cardNodes.length
+          ? []
+          : Array.from(document.querySelectorAll('a[href*="/markets/"], a[href*="/MarketDetails"]'));
+
+        const nodes = cardNodes.length ? cardNodes : linkNodes;
+
+        const out = nodes.map((el) => {
+          const isLink = el.tagName?.toLowerCase() === 'a';
+          const hrefEl = isLink ? el : el.querySelector?.('a[href*="/markets/"], a[href*="/MarketDetails"]');
+          const href = hrefEl ? hrefEl.getAttribute('href') : null;
+
+          // id from data-* or from href
+          let id =
+            el.getAttribute?.('data-id') ||
+            el.getAttribute?.('data-market-id') ||
+            null;
+
+          if (!id && href) {
+            // /markets/<slug> OR /MarketDetails?id=<id>
+            let m = href.match(/\/markets\/([^/?#]+)/i);
+            if (!m) m = href.match(/[?&]id=([^&#]+)/i);
+            if (m) id = m[1];
+          }
+
+          // title
+          let title =
+            text(el.querySelector?.('.market-title')) ||
+            text(el.querySelector?.('h1, h2, h3')) ||
+            (hrefEl ? text(hrefEl) : '');
+
+          // status
+          let statusRaw =
+            text(el.querySelector?.('.market-status, .status, .badge-status')).toLowerCase();
+          let status = 'open';
+          const block = text(el).toLowerCase();
+          if (statusRaw.includes('resolved') || block.includes('resolved')) status = 'resolved';
+          else if (
+            statusRaw.includes('closed') ||
+            statusRaw.includes('finished') ||
+            statusRaw.includes('ended') ||
+            block.includes('closed') ||
+            block.includes('finished') ||
+            block.includes('ended')
+          ) {
+            status = 'closed';
+          }
+
+          // ---- options (2 or 3) ----
+          let options = [];
+
+          // Try structured rows first
+          for (const sel of optionRowSelectors) {
+            const rows = Array.from(el.querySelectorAll?.(sel) || []);
+            if (rows.length >= 2) {
+              options = rows.map((row) => {
+                const label =
+                  text(row.querySelector('.label, .name, .team, .option-label')) ||
+                  text(row.querySelector('strong, span'));
+                const pct =
+                  getPct(row.querySelector('.percent, .percentage, .progress-label, .option-percent'));
+                return { label: label || '', pct: Number.isFinite(pct) ? pct : null };
+              }).filter(o => o.label || o.pct !== null);
+
+              if (options.length >= 2) break;
+            }
+          }
+
+          // Fallback: grab first 2–3 labels + percents anywhere inside card
+          if (options.length < 2) {
+            const labels = Array.from(el.querySelectorAll?.('.label, .name, .team') || [])
+              .map((n) => text(n))
+              .filter(Boolean)
+              .slice(0, 3);
+            const percNodes = Array.from(el.querySelectorAll?.('.percent, .percentage, .progress-label') || [])
+              .slice(0, 3);
+            const pcts = percNodes.map(getPct);
+            const len = Math.max(labels.length, pcts.length);
+            if (len >= 2) {
+              options = Array.from({ length: len }).map((_, i) => ({
+                label: labels[i] || (i === 2 ? 'Draw' : `Option ${i + 1}`),
+                pct: Number.isFinite(pcts[i]) ? pcts[i] : null
+              }));
+            }
+          }
+
+          // If exactly 2 options and only one pct given, infer the other as (100 - x)
+          if (options.length === 2) {
+            const a = options[0], b = options[1];
+            if (a.pct != null && (b.pct == null)) b.pct = 100 - a.pct;
+            if (b.pct != null && (a.pct == null)) a.pct = 100 - b.pct;
+          }
+
+          // Clamp/clean percentages
+          options = options.map(o => ({
+            label: o.label || 'Option',
+            pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
+          }));
+
+          // winner (when resolved) — try explicit, then by class, else null
+          let winner =
+            text(el.querySelector?.('.winner .name, .winner, .result-winner')) || null;
+
+          if (!winner) {
+            const winNode = el.querySelector?.('.option.winner, .side.winner, .option-a.winner, .option-b.winner, .option-c.winner');
+            if (winNode) {
+              const wlabel =
+                text(winNode.querySelector('.label, .name, .team')) ||
+                text(winNode);
+              if (wlabel) winner = wlabel;
+            }
+          }
+
+          const absoluteUrl =
+            href && !href.startsWith('http')
+              ? `${location.origin}${href}`
+              : href || location.href;
+
+          return id && title && absoluteUrl
+            ? { id, title, url: absoluteUrl, status, options, winner: winner || null }
+            : null;
+        });
+
+        return out.filter(Boolean);
+      });
+
+      await page.close();
+      if (markets.length) return markets;
+      // If empty, try next candidate URL
+    } catch (err) {
+      console.error(`fetchMarkets error for ${url}:`, err.message);
+    }
+  }
+
+  return [];
+}
+
+// ----------------- MSG TEMPLATES -----------------
+function escapeMd(s = '') {
+  // Escape for Telegram MarkdownV2
+  return s.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+}
+
+function formatOptionsList(options = []) {
+  // e.g., "Home: 45% | Draw: 12% | Away: 43%"
+  if (!options.length) return '—';
+  const parts = options.map(o => `${escapeMd(o.label)}: *${o.pct ?? '?'}%*`);
+  return parts.join('  |  ');
+}
+
 function fmtNewMarket(m) {
   return [
     '🔥 *New Market Live on Auracle!*',
     `🏟️ *${escapeMd(m.title)}*`,
     '📈 Pool is open — make your prediction.',
-    `🔗 ${m.url}`
+    `🔗 ${m.url}`,
   ].join('\n');
 }
+
 function fmtClosed(m) {
-  const p = m.percentages || {};
   return [
     '🛑 *Market Closed — Final Pool*',
     `🏟️ *${escapeMd(m.title)}*`,
-    `📊 ${escapeMd(p.aLabel ?? 'A')}: *${p.aPct ?? '?'}%*  |  ${escapeMd(p.bLabel ?? 'B')}: *${p.bPct ?? '?'}%*`,
+    `📊 ${formatOptionsList(m.options)}`,
     '👀 Waiting for result…',
-    `🔗 ${m.url}`
+    `🔗 ${m.url}`,
   ].join('\n');
 }
+
 function fmtResolved(m) {
-  const p = m.percentages || {};
   return [
     '✅ *Market Resolved*',
     `🏟️ *${escapeMd(m.title)}*`,
     `🏆 *Winner:* ${escapeMd(m.winner ?? '—')}`,
-    `📊 Final: ${escapeMd(p.aLabel ?? 'A')}: *${p.aPct ?? '?'}%*  |  ${escapeMd(p.bLabel ?? 'B')}: *${p.bPct ?? '?'}%*`,
+    `📊 Final: ${formatOptionsList(m.options)}`,
     '💰 Rewards available on Auracle.',
-    `🔗 ${m.url}`
+    `🔗 ${m.url}`,
   ].join('\n');
 }
 
-// Minimal Markdown escaper for underscores/asterisks/brackets/parentheses
-function escapeMd(s='') {
-  return s.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
-}
-
-// ---- TELEGRAM SEND ----
+// ----------------- TELEGRAM SEND -----------------
 async function send(msg) {
   try {
-    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, msg, {
+      parse_mode: 'MarkdownV2',
+      disable_web_page_preview: true,
+    });
   } catch (e) {
     console.error('Telegram send error:', e.message);
   }
 }
 
-// ---- POLLER ----
+// ----------------- POLLING TICK -----------------
 async function tick() {
   try {
     const markets = await fetchMarkets();
     const state = loadState();
 
     for (const m of markets) {
-      const prev = state.markets[m.id] || { announcedOpen: false, announcedClosed: false, announcedResolved: false };
+      const prev = state.markets[m.id] || {
+        announcedOpen: false,
+        announcedClosed: false,
+        announcedResolved: false,
+      };
       const next = { ...prev };
 
       if (m.status === 'open' && !prev.announcedOpen) {
@@ -226,9 +379,9 @@ async function tick() {
   }
 }
 
-// ---- COMMANDS ----
-bot.command('ping', ctx => ctx.reply('pong 🏓'));
-bot.command('health', async ctx => {
+// ----------------- COMMANDS -----------------
+bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
+bot.command('health', async (ctx) => {
   try {
     const markets = await fetchMarkets();
     await ctx.reply(`OK. Found ${markets.length} markets.`);
@@ -237,14 +390,20 @@ bot.command('health', async ctx => {
   }
 });
 
-// ---- START ----
+// ----------------- START -----------------
 bot.launch().then(() => {
   console.log('Bot started.');
-  tick(); // immediate
-  const step = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30); // safety min 5s
-  cron.schedule(`*/${step} * * * * *`, tick);
+  const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30); // min 5s
+  tick(); // run immediately
+  cron.schedule(`*/${interval} * * * * *`, tick);
 });
 
-// ---- GRACEFUL ----
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// ----------------- GRACEFUL SHUTDOWN -----------------
+process.once('SIGINT', async () => {
+  try { if (browser) await browser.close(); } catch {}
+  bot.stop('SIGINT');
+});
+process.once('SIGTERM', async () => {
+  try { if (browser) await browser.close(); } catch {}
+  bot.stop('SIGTERM');
+});

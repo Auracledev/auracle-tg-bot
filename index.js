@@ -23,8 +23,9 @@ const {
 
 const dbg = !!DEBUG;
 
-if (!TELEGRAM_BOT_TOKEN || !(TELEGRAM_CHAT_ID || true)) {
-  console.error('Missing env: TELEGRAM_BOT_TOKEN (and ideally TELEGRAM_CHAT_ID).');
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error('Missing env: TELEGRAM_BOT_TOKEN');
+  process.exit(1);
 }
 
 // ----------------- TELEGRAM -----------------
@@ -76,6 +77,14 @@ function setTargetChatId(id) {
 
 // ----------------- UTILS -----------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function escapeHtml(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ----------------- PUPPETEER (singleton) -----------------
 let browser = null;
@@ -308,49 +317,48 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
   return data;
 }
 
-// ----------------- MSG TEMPLATES -----------------
-function escapeMd(s = '') {
-  return s.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
-}
+// ----------------- MSG TEMPLATES (HTML) -----------------
 function formatOptionsList(options = []) {
   if (!options.length) return '—';
-  const parts = options.map((o) => `${escapeMd(o.label)}: *${o.pct ?? '?'}%*`);
+  const parts = options.map((o) =>
+    `${escapeHtml(o.label)}: <b>${o.pct ?? '?' }%</b>`
+  );
   return parts.join('  |  ');
 }
 function fmtNewMarket(m) {
   return [
-    '🔥 *New Market Live on Auracle!*',
-    `🏟️ *${escapeMd(m.title)}*`,
+    '🔥 <b>New Market Live on Auracle</b>',
+    `🏟️ <b>${escapeHtml(m.title)}</b>`,
     '📈 Pool is open — make your prediction.',
-    `🔗 ${m.url}`,
+    `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
 function fmtClosed(m) {
   return [
-    '🛑 *Market Closed — Final Pool*',
-    `🏟️ *${escapeMd(m.title)}*`,
+    '🛑 <b>Market Closed — Final Pool</b>',
+    `🏟️ <b>${escapeHtml(m.title)}</b>`,
     `📊 ${formatOptionsList(m.options)}`,
     '👀 Waiting for result…',
-    `🔗 ${m.url}`,
+    `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
 function fmtResolved(m) {
   return [
-    '✅ *Market Resolved*',
-    `🏟️ *${escapeMd(m.title)}*`,
-    `🏆 *Winner:* ${escapeMd(m.winner ?? '—')}`,
+    '✅ <b>Market Resolved</b>',
+    `🏟️ <b>${escapeHtml(m.title)}</b>`,
+    `🏆 <b>Winner:</b> ${escapeHtml(m.winner ?? '—')}`,
     `📊 Final: ${formatOptionsList(m.options)}`,
     '💰 Rewards available on Auracle.',
-    `🔗 ${m.url}`,
+    `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
 
-// ----------------- TELEGRAM SEND -----------------
+// ----------------- TELEGRAM SEND (HTML) -----------------
 async function send(msg, tag = '') {
   const chatId = getTargetChatId();
   try {
     const m = await bot.telegram.sendMessage(chatId, msg, {
-      parse_mode: 'MarkdownV2',
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
     });
     if (dbg) console.log(`[send] OK → chat ${chatId} ${tag ? '[' + tag + ']' : ''} message_id=${m?.message_id}`);

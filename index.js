@@ -84,6 +84,23 @@ function escapeHtml(s = '') {
     .replace(/'/g, '&#39;');
 }
 
+// Turn a future time (ms) into "in about 29 days", etc.
+function humanizeEta(targetMs, nowMs = Date.now()) {
+  if (!Number.isFinite(targetMs)) return '';
+  let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000)); // seconds
+  const min = Math.floor(diff / 60);
+  const hr  = Math.floor(min / 60);
+  const day = Math.floor(hr / 24);
+
+  if (day >= 2)  return `in about ${day} days`;
+  if (day === 1) return `in about 1 day`;
+  if (hr  >= 2)  return `in about ${hr} hours`;
+  if (hr  === 1) return `in about 1 hour`;
+  if (min >= 2)  return `in about ${min} minutes`;
+  if (min === 1) return `in about 1 minute`;
+  return `in about moments`;
+}
+
 // ---------- Puppeteer (singleton) ----------
 let browser = null;
 
@@ -108,7 +125,7 @@ async function newPage() {
   const page = await b.newPage();
   await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) AuracleBot/1.0 Chrome/117 Safari/537.36');
   await page.setViewport({ width: 1280, height: 1024 });
-  await page.setCacheEnabled(false); // disable cache to avoid edge caching
+  await page.setCacheEnabled(false);
   return page;
 }
 async function autoScroll(page) {
@@ -174,15 +191,40 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
 
           const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
+          // Category
           const category =
             text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
 
+          // Robust endsIn: collect candidates inside the card and pick the LARGEST window
+          const MINUTES = (n, unit) => {
+            unit = (unit || '').toLowerCase();
+            if (unit.startsWith('day'))   return n * 24 * 60;
+            if (unit.startsWith('hour'))  return n * 60;
+            if (unit.startsWith('min'))   return n;
+            return n;
+          };
           let endsIn = '';
-          const smalls = Array.from(cardRoot?.querySelectorAll('time, .text-xs, .text-sm, [data-testid="ends-in"], .ends-in') || [])
-            .map(el => text(el));
-          const endsCand = smalls.find(t => /in\b.*(hour|day|minute|about)/i.test(t) || /about/i.test(t));
-          if (endsCand) endsIn = endsCand;
+          let bestMins = -1;
+          const timeNodes = Array.from(
+            cardRoot?.querySelectorAll(
+              'time, [data-testid="ends-in"], .ends-in, .text-xs, .text-sm, [class*="ends"], [class*="countdown"]'
+            ) || []
+          );
+          for (const el of timeNodes) {
+            const t = (el.textContent || '').trim();
+            const re = /\b(?:in\s+about|about|in)\s+(\d+)\s*(days?|hours?|minutes?)\b/i;
+            const m = t.match(re);
+            if (m) {
+              const n = parseInt(m[1], 10);
+              const mins = MINUTES(n, m[2]);
+              if (Number.isFinite(mins) && mins > bestMins) {
+                bestMins = mins;
+                endsIn = t;
+              }
+            }
+          }
 
+          // Options
           const rowSelectors = [
             '.option', '.side', '.row',
             '.left, .center, .right',
@@ -215,6 +257,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             if (options.length >= 3) break;
           }
 
+          // ID
           let id = null;
           try {
             const u = new URL(abs);
@@ -290,7 +333,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 
     const cand = [];
     if (og) cand.push({ t: og, s: scoreTitle(og) });
-
     for (const n of nodes) {
       const t = text(n);
       cand.push({ t, s: scoreTitle(t) });
@@ -301,16 +343,12 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       const blk = pct.closest('article, section, div');
       if (blk) {
         const localHead = blk.querySelector('h1, h2, h3, .market-title, .title');
-        if (localHead) {
-          const t = text(localHead);
-          cand.push({ t, s: scoreTitle(t) + 5 });
-        }
+        if (localHead) cand.push({ t: text(localHead), s: scoreTitle(text(localHead)) + 5 });
       }
     }
 
     cand.sort((a, b) => b.s - a.s);
     let bestTitle = (cand.find(x => x.s > 0)?.t || '').trim();
-
     if (!bestTitle) {
       let dt = (document.title || '').trim();
       let parts = dt.split(/[\|\-•—]/).map(s => s.trim()).filter(Boolean);
@@ -380,13 +418,74 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     if (winner) status = 'resolved';
     else if (isClosedText) status = 'closed';
 
+    // ---- CLOSE date/time extraction from detail page ----
+    function parseCloseTextToDate(text) {
+      if (!text) return null;
+      const re = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\s+at\s+\d{1,2}:\d{2}\s*(AM|PM)\b/i;
+      const m = text.match(re);
+      if (m) {
+        const d = new Date(m[0]);
+        if (!isNaN(d.getTime())) return d.toISOString();
+      }
+      const reDate = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\b/i;
+      const reTime = /\b\d{1,2}:\d{2}\s*(AM|PM)\b/i;
+      const md = text.match(reDate);
+      const mt = text.match(reTime);
+      if (md) {
+        const str = md[0] + (mt ? (' ' + mt[0]) : '');
+        const d = new Date(str);
+        if (!isNaN(d.getTime())) return d.toISOString();
+      }
+      return null;
+    }
+
+    let closeISO = null;
+    let closeText = '';
+
+    const closeLabel = Array.from(document.querySelectorAll('*')).find(el => {
+      const t = (el.textContent || '').trim().toUpperCase();
+      return t === 'CLOSE' || t === 'CLOSES' || t === 'CLOSING' || t === 'CLOSE DATE';
+    });
+
+    if (closeLabel) {
+      const candidates = [];
+      if (closeLabel.nextElementSibling) candidates.push(closeLabel.nextElementSibling);
+      if (closeLabel.parentElement) {
+        candidates.push(closeLabel.parentElement.querySelector('time'));
+        candidates.push(closeLabel.parentElement.querySelector('.text-sm, .text-xs, .ends-in, [data-testid="ends-in"]'));
+      }
+      const uniq = Array.from(new Set(candidates.filter(Boolean)));
+      for (const el of uniq) {
+        const t = (el?.textContent || '').trim();
+        if (!t) continue;
+        const iso = parseCloseTextToDate(t);
+        if (iso) { closeISO = iso; closeText = t; break; }
+      }
+    }
+
+    if (!closeISO) {
+      const bodyTxt = (document.body?.innerText || '').replace(/\s+/g, ' ');
+      const iso = parseCloseTextToDate(bodyTxt);
+      if (iso) {
+        closeISO = iso;
+        const d = new Date(iso);
+        closeText = d.toLocaleString();
+      }
+    }
+
     let id = null;
     try {
       const u = new URL(location.href);
       id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
     } catch {}
 
-    return { id, title: bestTitle, url: location.href, status, options, winner: winner || null };
+    return {
+      id, title: bestTitle, url: location.href,
+      status, options, winner: winner || null,
+      endsIn: '',
+      closeISO: closeISO || '',
+      closeText: closeText || ''
+    };
   });
 
   await page.close();
@@ -497,12 +596,25 @@ async function tick() {
 
       if (detail.status === 'open') {
         const card = activeById.get(detail.id) || trendingById.get(detail.id);
+
+        // Prefer detail.closeISO to compute endsIn
+        if (detail.closeISO) {
+          const ms = Date.parse(detail.closeISO);
+          if (Number.isFinite(ms)) {
+            detail.endsIn = humanizeEta(ms);
+          }
+        }
+        // Fallback to list-card endsIn
+        if (!detail.endsIn && card?.endsIn) {
+          detail.endsIn = card.endsIn;
+        }
+
         if (card) {
           detail.category = card.category || detail.category;
-          detail.endsIn   = card.endsIn   || detail.endsIn;
           if (Array.isArray(card.options) && card.options.length >= 2) detail.options = card.options;
         }
       }
+
       results.push(detail);
     }
 
@@ -520,7 +632,7 @@ async function tick() {
           url:               m.url,
           missingCount:      0,
           wasTrending:       trendingIds.has(m.id),
-          lastSeen:          card ? { title: m.title, category: card.category, endsIn: card.endsIn, options: card.options } :
+          lastSeen:          card ? { title: m.title, category: card.category, endsIn: m.endsIn || card.endsIn, options: card.options } :
                                     { title: m.title, category: m.category, endsIn: m.endsIn, options: m.options },
           closedSnapshot:    m.status === 'closed' ? { options: (m.options || []) } : null
         };
@@ -533,7 +645,7 @@ async function tick() {
 
     console.log('[tick] scraped detail count:', results.length);
 
-    // update "missing" counter (not used for closure anymore, but useful telemetry)
+    // update "missing" counter (telemetry only)
     for (const id of Object.keys(state.markets)) {
       state.markets[id].missingCount =
         (activeIds.has(id) || trendingIds.has(id)) ? 0 : ((state.markets[id].missingCount || 0) + 1);
@@ -553,13 +665,12 @@ async function tick() {
         next.lastSeen = {
           title: m.title,
           category: card?.category ?? m.category,
-          endsIn: card?.endsIn ?? m.endsIn,
+          endsIn: m.endsIn || card?.endsIn || prev.lastSeen?.endsIn || '',
           options: Array.isArray(seenOpts) ? seenOpts : (prev.lastSeen?.options || [])
         };
       }
 
-      // NO infer-close block anymore — only trust detail page
-
+      // Only trust detail page for closed/resolved
       if (m.status === 'closed' && !next.closedSnapshot) {
         const finalOpts = (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || [];
         next.closedSnapshot = { options: finalOpts };
@@ -571,7 +682,7 @@ async function tick() {
           ...m,
           title: m.title || prev.lastSeen?.title || card?.title || 'Unknown',
           category: next.lastSeen?.category ?? card?.category ?? m.category,
-          endsIn: next.lastSeen?.endsIn ?? card?.endsIn ?? m.endsIn,
+          endsIn: next.lastSeen?.endsIn ?? m.endsIn,
           options: (card?.options?.length ? card.options :
                     next.lastSeen?.options?.length ? next.lastSeen.options :
                     m.options)

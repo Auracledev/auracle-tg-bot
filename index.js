@@ -15,8 +15,8 @@ const {
   TELEGRAM_CHAT_ID,
   AURACLE_BASE_URL = 'https://auracle.fi',
   POLL_INTERVAL_SECONDS = '30',
-  DATA_DIR = '/data', // On Render, mount a disk here; during local dev, you can set ./data
-  DEBUG, // set to "1" to see verbose logs
+  DATA_DIR = '/data', // mount a disk here on your host; for local dev you can set ./data
+  DEBUG, // set to "1" to enable verbose logs
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -92,262 +92,203 @@ async function autoScroll(page) {
  *   title: string,
  *   url: string,
  *   status: "open" | "closed" | "resolved",
- *   options: Array<{ label: string, pct: number|null }>,   // 2 or 3 (e.g., includes "Draw"); supports more
+ *   options: Array<{ label: string, pct: number|null }>,   // 2 or 3+ (supports Draw)
  *   winner: string|null                                     // label of winning option when resolved
  * }
  */
+
+// Collect markets from /markets (or /Markets) and scrape each details page
 async function fetchMarkets({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
-  const candidates = [`${base}/markets`, `${base}/Markets`];
+  const listCandidates = [`${base}/markets`, `${base}/Markets`];
 
-  for (const url of candidates) {
+  // 1) Open markets list and collect links to MarketDetails (or /markets/<id>)
+  let detailLinks = [];
+  for (const url of listCandidates) {
     try {
       const page = await newPage();
-      if (debug || dbg) console.log('[markets] goto', url);
+      if (debug || dbg) console.log('[markets:list] goto', url);
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-      // PROBE: are there any useful links at all?
-      const probe = await page.evaluate(() => {
-        const a = Array.from(document.querySelectorAll('a[href]'))
-          .map((el) => el.getAttribute('href'))
-          .filter(Boolean);
-        const marketLinks = a.filter((h) => /\/markets\//i.test(h) || /MarketDetails/i.test(h));
-        return { totalLinks: a.length, marketLinks: marketLinks.slice(0, 10) };
-      });
-      if (debug || dbg) console.log('[probe]', probe);
-
-      if (!probe.marketLinks.length) {
-        await autoScroll(page);
-        await page.waitForTimeout(1500);
-        const probe2 = await page.evaluate(() => {
-          const a = Array.from(document.querySelectorAll('a[href]'))
-            .map((el) => el.getAttribute('href'))
-            .filter(Boolean);
-          const marketLinks = a.filter((h) => /\/markets\//i.test(h) || /MarketDetails/i.test(h));
-          return { totalLinks: a.length, marketLinks: marketLinks.slice(0, 10) };
-        });
-        if (debug || dbg) console.log('[probe2]', probe2);
-      }
-
-      // WAIT for likely containers
-      const readySelectors = [
-        '.market-card',
-        '[data-market-id]',
-        '.card-market',
-        'a[href*="/markets/"]',
-        'a[href*="/MarketDetails"]',
-      ];
-      let ready = false;
-      for (const sel of readySelectors) {
-        try {
-          await page.waitForSelector(sel, { timeout: 8000 });
-          ready = true;
-          break;
-        } catch {}
-      }
-      if (!ready) {
-        await autoScroll(page);
-        for (const sel of readySelectors) {
-          try {
-            await page.waitForSelector(sel, { timeout: 4000 });
-            ready = true;
-            break;
-          } catch {}
-        }
-      }
-      if (!ready) {
-        if (debug || dbg) {
-          const bodySnippet = await page.evaluate(
-            () => document.body?.innerText?.slice(0, 500) || ''
-          );
-          console.log('[markets] no selectors matched. body snippet:', bodySnippet);
-        }
-        await page.close();
-        continue; // try next candidate URL
-      }
-
-      // Ensure virtualized lists render
       await autoScroll(page);
+      await page.waitForTimeout(1000);
 
-      const markets = await page.evaluate(() => {
-        const text = (el) => (el?.textContent || '').trim();
-        const getPct = (node) => {
-          const s = text(node).replace('%', '').replace(/[^\d.]/g, '');
-          const n = parseFloat(s);
-          return Number.isFinite(n) ? Math.round(n) : null;
-        };
+      // collect up to 50 market links
+      const links = await page.evaluate(() => {
+        const hrefs = Array.from(document.querySelectorAll('a[href]'))
+          .map(a => a.getAttribute('href'))
+          .filter(Boolean);
 
-        const optionRowSelectors = [
-          '.option', '.side',
-          '.option-a, .option-b, .option-c',
-          '.side-a, .side-b, .side-c',
-          '.left, .right, .center',
-        ];
-
-        const cardNodes = Array.from(
-          document.querySelectorAll('.market-card, [data-market-id], .card-market')
-        );
-        const linkNodes = cardNodes.length
-          ? []
-          : Array.from(
-              document.querySelectorAll('a[href*="/markets/"], a[href*="/MarketDetails"]')
-            );
-
-        const nodes = cardNodes.length ? cardNodes : linkNodes;
-
-        const out = nodes.map((el) => {
-          const isLink = el.tagName?.toLowerCase() === 'a';
-          const hrefEl = isLink
-            ? el
-            : el.querySelector?.('a[href*="/markets/"], a[href*="/MarketDetails"]');
-          const href = hrefEl ? hrefEl.getAttribute('href') : null;
-
-          // id from data-* or from href
-          let id =
-            el.getAttribute?.('data-id') ||
-            el.getAttribute?.('data-market-id') ||
-            null;
-          if (!id && href) {
-            let m = href.match(/\/markets\/([^/?#]+)/i);
-            if (!m) m = href.match(/[?&]id=([^&#]+)/i);
-            if (m) id = m[1];
+        const marketLinks = [];
+        for (const h of hrefs) {
+          if (/\/MarketDetails\?id=/.test(h) || /\/markets\//.test(h)) {
+            const abs = h.startsWith('http') ? h : `${location.origin}${h}`;
+            if (!marketLinks.includes(abs)) marketLinks.push(abs);
           }
-
-          // title
-          let title =
-            text(el.querySelector?.('.market-title')) ||
-            text(el.querySelector?.('h1, h2, h3')) ||
-            (hrefEl ? text(hrefEl) : '');
-
-          // status
-          let statusRaw =
-            text(el.querySelector?.('.market-status, .status, .badge-status')).toLowerCase();
-          let status = 'open';
-          const block = text(el).toLowerCase();
-          if (statusRaw.includes('resolved') || block.includes('resolved')) status = 'resolved';
-          else if (
-            statusRaw.includes('closed') ||
-            statusRaw.includes('finished') ||
-            statusRaw.includes('ended') ||
-            block.includes('closed') ||
-            block.includes('finished') ||
-            block.includes('ended')
-          ) {
-            status = 'closed';
-          }
-
-          // ---- options (2, 3, or more) ----
-          let options = [];
-
-          // Try structured rows first
-          for (const sel of optionRowSelectors) {
-            const rows = Array.from(el.querySelectorAll?.(sel) || []);
-            if (rows.length >= 2) {
-              options = rows
-                .map((row) => {
-                  const label =
-                    text(
-                      row.querySelector('.label, .name, .team, .option-label')
-                    ) || text(row.querySelector('strong, span'));
-                  const pct = getPct(
-                    row.querySelector(
-                      '.percent, .percentage, .progress-label, .option-percent'
-                    )
-                  );
-                  return {
-                    label: label || '',
-                    pct: Number.isFinite(pct) ? pct : null,
-                  };
-                })
-                .filter((o) => o.label || o.pct !== null);
-              if (options.length >= 2) break;
-            }
-          }
-
-          // Fallback: first 2–3 labels + percents anywhere inside card
-          if (options.length < 2) {
-            const labels = Array.from(
-              el.querySelectorAll?.('.label, .name, .team') || []
-            )
-              .map((n) => text(n))
-              .filter(Boolean)
-              .slice(0, 3);
-            const percNodes = Array.from(
-              el.querySelectorAll?.('.percent, .percentage, .progress-label') || []
-            ).slice(0, 3);
-            const pcts = percNodes.map(getPct);
-            const len = Math.max(labels.length, pcts.length);
-            if (len >= 2) {
-              options = Array.from({ length: len }).map((_, i) => ({
-                label: labels[i] || (i === 2 ? 'Draw' : `Option ${i + 1}`),
-                pct: Number.isFinite(pcts[i]) ? pcts[i] : null,
-              }));
-            }
-          }
-
-          // If exactly 2 options and only one pct given, infer the other as (100 - x)
-          if (options.length === 2) {
-            const a = options[0],
-              b = options[1];
-            if (a.pct != null && b.pct == null) b.pct = 100 - a.pct;
-            if (b.pct != null && a.pct == null) a.pct = 100 - b.pct;
-          }
-
-          // Clamp/clean percentages
-          options = options.map((o) => ({
-            label: o.label || 'Option',
-            pct:
-              o.pct != null && o.pct >= 0 && o.pct <= 100
-                ? Math.round(o.pct)
-                : null,
-          }));
-
-          // winner (when resolved)
-          let winner =
-            text(el.querySelector?.('.winner .name, .winner, .result-winner')) ||
-            null;
-          if (!winner) {
-            const winNode = el.querySelector?.(
-              '.option.winner, .side.winner, .option-a.winner, .option-b.winner, .option-c.winner'
-            );
-            if (winNode) {
-              const wlabel =
-                text(winNode.querySelector('.label, .name, .team')) ||
-                text(winNode);
-              if (wlabel) winner = wlabel;
-            }
-          }
-
-          const absoluteUrl =
-            href && !href.startsWith('http')
-              ? `${location.origin}${href}`
-              : href || location.href;
-
-          return id && title && absoluteUrl
-            ? {
-                id,
-                title,
-                url: absoluteUrl,
-                status,
-                options,
-                winner: winner || null,
-              }
-            : null;
-        });
-
-        return out.filter(Boolean);
+        }
+        return marketLinks.slice(0, 50);
       });
 
+      if (debug || dbg) console.log('[markets:list] links found:', links.length);
       await page.close();
-      if (debug || dbg) console.log('[markets] fetched', markets.length, 'from', url);
-      if (markets.length) return markets;
+
+      if (links.length) { detailLinks = links; break; }
     } catch (err) {
-      if (debug || dbg) console.error(`[fetchMarkets] ${url} ->`, err.message);
-      // try next candidate url
+      if (debug || dbg) console.log('[markets:list] error', err.message);
+      // try next candidate
     }
   }
 
-  return [];
+  if (!detailLinks.length) {
+    if (debug || dbg) console.log('[markets:list] no links found');
+    return [];
+  }
+
+  // 2) Visit each details page and scrape normalized data (sequential for stability)
+  const results = [];
+  for (const url of detailLinks) {
+    try {
+      const m = await scrapeMarketDetail(url, { debug });
+      if (m) results.push(m);
+    } catch (e) {
+      if (debug || dbg) console.log('[markets:detail] error', e.message, 'for', url);
+    }
+  }
+
+  if (debug || dbg) console.log('[markets] total scraped:', results.length);
+  return results;
+}
+
+// Scrape a single MarketDetails page
+async function scrapeMarketDetail(url, { debug = false } = {}) {
+  const page = await newPage();
+  if (debug || dbg) console.log('[detail] goto', url);
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+
+  await autoScroll(page);
+  await page.waitForTimeout(800);
+
+  const data = await page.evaluate(() => {
+    const text = (el) => (el?.textContent || '').trim();
+    const getPctFromNode = (node) => {
+      if (!node) return null;
+      const s = text(node).replace('%','').replace(/[^\d.]/g,'');
+      const n = parseFloat(s);
+      return Number.isFinite(n) ? Math.round(n) : null;
+    };
+
+    // Title: prefer big heading, then document.title
+    let title = text(document.querySelector('.market-title, h1, h2, [data-testid="market-title"]')) || document.title || '';
+
+    // Status: heuristics
+    const bodyTxt = (document.body?.innerText || '').toLowerCase();
+    let status = 'open';
+    if (bodyTxt.includes('resolved')) status = 'resolved';
+    else if (bodyTxt.includes('closed') || bodyTxt.includes('finished') || bodyTxt.includes('ended')) status = 'closed';
+
+    // Options: attempt structured selectors first
+    const optionRowSelectors = [
+      '.option', '.side',
+      '.option-a, .option-b, .option-c',
+      '.side-a, .side-b, .side-c',
+      '.left, .right, .center',
+      '[data-option]', '[role="listitem"]'
+    ];
+
+    let options = [];
+    for (const sel of optionRowSelectors) {
+      const rows = Array.from(document.querySelectorAll(sel));
+      if (rows.length >= 2) {
+        options = rows.map((row, i) => {
+          const label =
+            text(row.querySelector('.label, .name, .team, .option-label, [data-testid="option-label"]')) ||
+            text(row.querySelector('strong, span, p')) ||
+            `Option ${i+1}`;
+          const pct =
+            getPctFromNode(row.querySelector('.percent, .percentage, .progress-label, .option-percent, [data-testid="option-percent"]'));
+          return { label, pct: Number.isFinite(pct) ? pct : null };
+        }).filter(o => o.label || o.pct !== null);
+        if (options.length >= 2) break;
+      }
+    }
+
+    // Fallback: find % nodes and infer nearby labels
+    if (options.length < 2) {
+      const candidates = Array.from(document.querySelectorAll('*'))
+        .filter(el => /%/.test(el.textContent || ''))
+        .slice(0, 6);
+
+      const seen = new Set();
+      const guesses = [];
+      for (const node of candidates) {
+        const pct = getPctFromNode(node);
+        if (pct == null) continue;
+
+        let label = '';
+        const prev = node.previousElementSibling;
+        if (prev && (prev.textContent || '').trim() && !/%/.test(prev.textContent)) {
+          label = text(prev);
+        }
+        if (!label) {
+          const parent = node.parentElement;
+          if (parent) {
+            const strong = parent.querySelector('strong, .label, .name, .team');
+            if (strong) label = text(strong);
+          }
+        }
+        if (!label) label = `Option ${guesses.length + 1}`;
+
+        const key = label + '|' + pct;
+        if (!seen.has(key)) {
+          guesses.push({ label, pct });
+          seen.add(key);
+        }
+      }
+      if (guesses.length >= 2) options = guesses.slice(0, 3);
+    }
+
+    // If exactly 2 options and one pct missing, infer from 100
+    if (options.length === 2) {
+      const [a, b] = options;
+      if (a.pct != null && b.pct == null) b.pct = 100 - a.pct;
+      if (b.pct != null && a.pct == null) a.pct = 100 - b.pct;
+    }
+
+    // Label cleanups + clamp %
+    options = options.map((o, i) => ({
+      label: (o.label || (i === 2 ? 'Draw' : `Option ${i+1}`)).trim(),
+      pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
+    }));
+
+    // Winner (if resolved)
+    let winner =
+      text(document.querySelector('.winner .name, .winner, .result-winner, [data-testid="winner"]')) || null;
+    if (!winner) {
+      const winNode = document.querySelector('.option.winner, .side.winner, .option-a.winner, .option-b.winner, .option-c.winner');
+      if (winNode) {
+        winner = text(winNode.querySelector('.label, .name, .team')) || text(winNode) || null;
+      }
+    }
+
+    // ID normalization from ?id=… or /markets/<id>
+    let id = null;
+    try {
+      const u = new URL(location.href);
+      id = u.searchParams.get('id');
+      if (!id) {
+        const m = u.pathname.match(/\/markets\/([^/]+)/i);
+        if (m) id = m[1];
+      }
+    } catch {}
+
+    return (id && title)
+      ? { id, title, url: location.href, status, options, winner }
+      : null;
+  });
+
+  await page.close();
+  if (debug || dbg) console.log('[detail] scraped', data ? data.id : 'null', 'status:', data?.status);
+  return data;
 }
 
 // ----------------- MSG TEMPLATES -----------------
@@ -448,7 +389,7 @@ bot.command('health', async (ctx) => {
     const markets = await fetchMarkets({ debug: true });
     if (!markets.length) {
       await ctx.reply(
-        'Fetched 0 markets (debug on). Check logs for [probe] and [markets] entries — selectors may need tweaking.'
+        'Fetched 0 markets (debug on). Check host logs for [markets:list], [detail], and [markets] entries — selectors may need a tweak.'
       );
     } else {
       const sample = markets
@@ -466,7 +407,6 @@ bot.command('health', async (ctx) => {
 bot.launch().then(async () => {
   console.log('Bot started.');
   try {
-    // (Nice to have) set commands for autocomplete
     await bot.telegram.setMyCommands([
       { command: 'ping', description: 'Ping the bot' },
       { command: 'health', description: 'Fetch market count' },
@@ -479,14 +419,10 @@ bot.launch().then(async () => {
 
 // ----------------- GRACEFUL SHUTDOWN -----------------
 process.once('SIGINT', async () => {
-  try {
-    if (browser) await browser.close();
-  } catch {}
+  try { if (browser) await browser.close(); } catch {}
   bot.stop('SIGINT');
 });
 process.once('SIGTERM', async () => {
-  try {
-    if (browser) await browser.close();
-  } catch {}
+  try { if (browser) await browser.close(); } catch {}
   bot.stop('SIGTERM');
 });

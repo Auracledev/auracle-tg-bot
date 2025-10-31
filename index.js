@@ -5,26 +5,27 @@ import { fileURLToPath } from 'url';
 import cron from 'node-cron';
 import { Telegraf } from 'telegraf';
 import puppeteer from 'puppeteer';
+import http from 'http';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ----------------- ENV -----------------
 const {
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID,
+  TELEGRAM_CHAT_ID,                // initial/fallback target; can be changed at runtime
   AURACLE_BASE_URL = 'https://auracle.fi',
   POLL_INTERVAL_SECONDS = '30',
-  DATA_DIR = '/data', // mount a disk here on your host; for local dev you can set ./data
-  DEBUG, // set to "1" to enable verbose logs
+  DATA_DIR = '/data',             // mount a disk here in prod; use ./data locally
+  DEBUG,
+  PORT = process.env.PORT || 3000 // for Railway/Render
 } = process.env;
 
-if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-  console.error('Missing env vars: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID');
-  process.exit(1);
-}
 const dbg = !!DEBUG;
+
+if (!TELEGRAM_BOT_TOKEN || !(TELEGRAM_CHAT_ID || true)) {
+  console.error('Missing env: TELEGRAM_BOT_TOKEN (and ideally TELEGRAM_CHAT_ID).');
+}
 
 // ----------------- TELEGRAM -----------------
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -33,10 +34,48 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const STATE_DIR = path.resolve(DATA_DIR);
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
-if (!fs.existsSync(STATE_FILE)) fs.writeFileSync(STATE_FILE, JSON.stringify({ markets: {} }, null, 2));
+if (!fs.existsSync(STATE_FILE)) fs.writeFileSync(STATE_FILE, JSON.stringify({ markets: {}, seeded: false }, null, 2));
 
-const loadState = () => JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+const loadState = () => {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
+  catch { return { markets: {}, seeded: false }; }
+};
 const saveState = (s) => fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+
+// ---- state helpers
+function summarizeState(state) {
+  const m = state.markets || {};
+  let total=0, open=0, closed=0, resolved=0, aO=0, aC=0, aR=0;
+  for (const id in m) {
+    total++;
+    const s = m[id];
+    if (s.lastStatus === 'open') open++;
+    if (s.lastStatus === 'closed') closed++;
+    if (s.lastStatus === 'resolved') resolved++;
+    if (s.announcedOpen) aO++;
+    if (s.announcedClosed) aC++;
+    if (s.announcedResolved) aR++;
+  }
+  return { total, open, closed, resolved, aO, aC, aR, seeded: !!state.seeded, targetChatId: state.targetChatId || TELEGRAM_CHAT_ID };
+}
+
+function getTargetChatId() {
+  try {
+    const st = loadState();
+    return st.targetChatId || TELEGRAM_CHAT_ID;
+  } catch {
+    return TELEGRAM_CHAT_ID;
+  }
+}
+function setTargetChatId(id) {
+  const st = loadState();
+  st.targetChatId = id;
+  saveState(st);
+  return id;
+}
+
+// ----------------- UTILS -----------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ----------------- PUPPETEER (singleton) -----------------
 let browser = null;
@@ -66,7 +105,6 @@ async function newPage() {
 }
 
 async function autoScroll(page) {
-  // Scroll to bottom to trigger lazy/virtualized lists
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       let total = 0;
@@ -87,23 +125,17 @@ async function autoScroll(page) {
 
 // ----------------- SCRAPER -----------------
 /**
- * Normalized market shape:
- * {
- *   id: string,
- *   title: string,
- *   url: string,
- *   status: "open" | "closed" | "resolved",
- *   options: Array<{ label: string, pct: number|null }>,   // 2 or 3+ (supports Draw)
- *   winner: string|null                                     // label of winning option when resolved
- * }
+ * Market:
+ * { id, title, url, status: "open"|"closed"|"resolved", options: [{label,pct}], winner|null }
  */
 
-// Collect markets from /markets (or /Markets) and scrape each details page
+// Collect markets from list page, then scrape each MarketDetails
 async function fetchMarkets({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
-  const listCandidates = [`${base}/markets`, `${base}/Markets`];
+  // Prefer the path that worked in your logs
+  const listCandidates = [`${base}/Markets`, `${base}/markets`];
 
-  // 1) Open markets list and collect links to MarketDetails (or /markets/<id>)
+  // 1) Gather detail links
   let detailLinks = [];
   for (const url of listCandidates) {
     try {
@@ -111,10 +143,11 @@ async function fetchMarkets({ debug = false } = {}) {
       if (debug || dbg) console.log('[markets:list] goto', url);
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
+      // wait for any anchor to render, then scroll
+      try { await page.waitForSelector('a[href]', { timeout: 8000 }); } catch {}
       await autoScroll(page);
       await sleep(1000);
 
-      // collect up to 50 market links
       const links = await page.evaluate(() => {
         const hrefs = Array.from(document.querySelectorAll('a[href]'))
           .map(a => a.getAttribute('href'))
@@ -136,7 +169,6 @@ async function fetchMarkets({ debug = false } = {}) {
       if (links.length) { detailLinks = links; break; }
     } catch (err) {
       if (debug || dbg) console.log('[markets:list] error', err.message);
-      // try next candidate
     }
   }
 
@@ -145,7 +177,7 @@ async function fetchMarkets({ debug = false } = {}) {
     return [];
   }
 
-  // 2) Visit each details page and scrape normalized data (sequential for stability)
+  // 2) Scrape each detail sequentially (stable on small hosts)
   const results = [];
   for (const url of detailLinks) {
     try {
@@ -160,12 +192,12 @@ async function fetchMarkets({ debug = false } = {}) {
   return results;
 }
 
-// Scrape a single MarketDetails page
 async function scrapeMarketDetail(url, { debug = false } = {}) {
   const page = await newPage();
   if (debug || dbg) console.log('[detail] goto', url);
   await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
+  try { await page.waitForSelector('body', { timeout: 8000 }); } catch {}
   await autoScroll(page);
   await sleep(800);
 
@@ -178,16 +210,13 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       return Number.isFinite(n) ? Math.round(n) : null;
     };
 
-    // Title: prefer big heading, then document.title
     let title = text(document.querySelector('.market-title, h1, h2, [data-testid="market-title"]')) || document.title || '';
 
-    // Status: heuristics
     const bodyTxt = (document.body?.innerText || '').toLowerCase();
     let status = 'open';
     if (bodyTxt.includes('resolved')) status = 'resolved';
     else if (bodyTxt.includes('closed') || bodyTxt.includes('finished') || bodyTxt.includes('ended')) status = 'closed';
 
-    // Options: attempt structured selectors first
     const optionRowSelectors = [
       '.option', '.side',
       '.option-a, .option-b, .option-c',
@@ -213,18 +242,15 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     }
 
-    // Fallback: find % nodes and infer nearby labels
     if (options.length < 2) {
       const candidates = Array.from(document.querySelectorAll('*'))
         .filter(el => /%/.test(el.textContent || ''))
         .slice(0, 6);
-
       const seen = new Set();
       const guesses = [];
       for (const node of candidates) {
         const pct = getPctFromNode(node);
         if (pct == null) continue;
-
         let label = '';
         const prev = node.previousElementSibling;
         if (prev && (prev.textContent || '').trim() && !/%/.test(prev.textContent)) {
@@ -238,30 +264,23 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
           }
         }
         if (!label) label = `Option ${guesses.length + 1}`;
-
         const key = label + '|' + pct;
-        if (!seen.has(key)) {
-          guesses.push({ label, pct });
-          seen.add(key);
-        }
+        if (!seen.has(key)) { guesses.push({ label, pct }); seen.add(key); }
       }
       if (guesses.length >= 2) options = guesses.slice(0, 3);
     }
 
-    // If exactly 2 options and one pct missing, infer from 100
     if (options.length === 2) {
       const [a, b] = options;
       if (a.pct != null && b.pct == null) b.pct = 100 - a.pct;
       if (b.pct != null && a.pct == null) a.pct = 100 - b.pct;
     }
 
-    // Label cleanups + clamp %
     options = options.map((o, i) => ({
       label: (o.label || (i === 2 ? 'Draw' : `Option ${i+1}`)).trim(),
       pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
     }));
 
-    // Winner (if resolved)
     let winner =
       text(document.querySelector('.winner .name, .winner, .result-winner, [data-testid="winner"]')) || null;
     if (!winner) {
@@ -271,7 +290,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     }
 
-    // ID normalization from ?id=… or /markets/<id>
     let id = null;
     try {
       const u = new URL(location.href);
@@ -282,9 +300,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     } catch {}
 
-    return (id && title)
-      ? { id, title, url: location.href, status, options, winner }
-      : null;
+    return (id && title) ? { id, title, url: location.href, status, options, winner } : null;
   });
 
   await page.close();
@@ -294,16 +310,13 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 
 // ----------------- MSG TEMPLATES -----------------
 function escapeMd(s = '') {
-  // Escape for Telegram MarkdownV2
   return s.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
 }
 function formatOptionsList(options = []) {
-  // e.g., "Home: 45% | Draw: 12% | Away: 43%"
   if (!options.length) return '—';
   const parts = options.map((o) => `${escapeMd(o.label)}: *${o.pct ?? '?'}%*`);
   return parts.join('  |  ');
 }
-
 function fmtNewMarket(m) {
   return [
     '🔥 *New Market Live on Auracle!*',
@@ -333,51 +346,73 @@ function fmtResolved(m) {
 }
 
 // ----------------- TELEGRAM SEND -----------------
-async function send(msg) {
+async function send(msg, tag = '') {
+  const chatId = getTargetChatId();
   try {
-    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, msg, {
+    const m = await bot.telegram.sendMessage(chatId, msg, {
       parse_mode: 'MarkdownV2',
       disable_web_page_preview: true,
     });
+    if (dbg) console.log(`[send] OK → chat ${chatId} ${tag ? '[' + tag + ']' : ''} message_id=${m?.message_id}`);
   } catch (e) {
-    console.error('Telegram send error:', e.message);
+    const desc = e?.response?.description || e.message;
+    console.error('[send] ERROR → chat', chatId, desc);
   }
 }
 
-// ----------------- POLLING TICK -----------------
+// ----------------- TICK LOOP -----------------
 async function tick() {
   try {
     if (dbg) console.log('[tick] run at', new Date().toISOString());
     const markets = await fetchMarkets({ debug: dbg });
-    const state = loadState();
+    let state = loadState();
+    if (!state || !state.markets) state = { markets: {}, seeded: false };
 
-    for (const m of markets) {
-      const prev =
-        state.markets[m.id] || {
-          announcedOpen: false,
-          announcedClosed: false,
-          announcedResolved: false,
+    // One-time cold start seed to avoid spam
+    if (!state.seeded && markets.length) {
+      if (dbg) console.log('[seed] first run — seeding', markets.length, 'markets');
+      for (const m of markets) {
+        state.markets[m.id] = {
+          announcedOpen:     m.status === 'open',
+          announcedClosed:   m.status === 'closed',
+          announcedResolved: m.status === 'resolved',
+          lastStatus:        m.status
         };
+      }
+      state.seeded = true;
+      saveState(state);
+      if (dbg) console.log('[seed] done');
+      return;
+    }
+
+    if (dbg) console.log('[tick] scraped', markets.length, 'markets');
+
+    // Normal incremental announcements
+    for (const m of markets) {
+      const prev = state.markets[m.id] || {
+        announcedOpen: false, announcedClosed: false, announcedResolved: false, lastStatus: 'unknown'
+      };
       const next = { ...prev };
 
       if (m.status === 'open' && !prev.announcedOpen) {
-        await send(fmtNewMarket(m));
+        await send(fmtNewMarket(m), 'OPEN');
         next.announcedOpen = true;
       }
       if (m.status === 'closed' && !prev.announcedClosed) {
-        await send(fmtClosed(m));
+        await send(fmtClosed(m), 'CLOSED');
         next.announcedClosed = true;
       }
       if (m.status === 'resolved' && !prev.announcedResolved) {
-        await send(fmtResolved(m));
+        await send(fmtResolved(m), 'RESOLVED');
         next.announcedResolved = true;
       }
 
+      next.lastStatus = m.status;
       state.markets[m.id] = next;
     }
 
     saveState(state);
-    if (dbg) console.log('[tick] done. markets seen:', markets.length);
+    if (dbg) console.log('[tick] done.', summarizeState(state));
   } catch (e) {
     console.error('tick error:', e.message);
   }
@@ -385,23 +420,73 @@ async function tick() {
 
 // ----------------- COMMANDS -----------------
 bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
+
 bot.command('health', async (ctx) => {
   try {
     const markets = await fetchMarkets({ debug: true });
     if (!markets.length) {
-      await ctx.reply(
-        'Fetched 0 markets (debug on). Check host logs for [markets:list], [detail], and [markets] entries — selectors may need a tweak.'
-      );
+      await ctx.reply('Fetched 0 markets (debug on). Check logs for [markets:list]/[detail] entries.');
     } else {
-      const sample = markets
-        .slice(0, 3)
-        .map((m) => m.title)
-        .join(' | ');
+      const sample = markets.slice(0, 3).map(m => m.title).join(' | ');
       await ctx.reply(`OK. Found ${markets.length} markets.\nSample: ${sample || '—'}`);
     }
   } catch (e) {
     await ctx.reply(`Fetch failed: ${String(e.message || e).slice(0, 300)}`);
   }
+});
+
+bot.command('whereami', async (ctx) => {
+  const target = getTargetChatId();
+  const here = ctx.chat?.id;
+  await ctx.reply(`Target chat: ${String(target)}\nThis chat: ${String(here)}\nTip: /set_target here`);
+});
+
+bot.command('set_target', async (ctx) => {
+  const parts = (ctx.message.text || '').trim().split(/\s+/);
+  const arg = parts[1];
+  if (!arg) { await ctx.reply('Usage: /set_target <chatId|here>'); return; }
+  const id = (arg === 'here') ? ctx.chat.id : arg;
+  setTargetChatId(id);
+  await ctx.reply(`OK. Target chat set to: ${id}`);
+});
+
+function chunk(arr, n){ const out=[]; for(let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; }
+
+bot.command('announce_open_now', async (ctx) => {
+  const parts = (ctx.message.text || '').trim().split(/\s+/);
+  const limit = Math.max(1, Math.min(parseInt(parts[1] || '3', 10) || 3, 20));
+  const markets = await fetchMarkets({ debug: false });
+  const openNow = markets.filter(m => m.status === 'open').slice(0, limit);
+
+  if (!openNow.length) { await ctx.reply('No open markets found right now.'); return; }
+
+  for (const batch of chunk(openNow, 5)) {
+    for (const m of batch) {
+      await send(fmtNewMarket(m), 'OPEN(TEST)');
+      const st = loadState();
+      st.markets[m.id] = { ...(st.markets[m.id] || {}), announcedOpen: true, lastStatus: 'open' };
+      saveState(st);
+    }
+  }
+  await ctx.reply(`Announced ${openNow.length} open market(s) to target chat.`);
+});
+
+bot.command('state', async (ctx) => {
+  try {
+    const s = summarizeState(loadState());
+    await ctx.reply(
+      `seeded: ${s.seeded}\n` +
+      `target: ${s.targetChatId}\n` +
+      `tracked: ${s.total}\n` +
+      `statuses: open=${s.open}, closed=${s.closed}, resolved=${s.resolved}\n` +
+      `announced: open=${s.aO}, closed=${s.aC}, resolved=${s.aR}`
+    );
+  } catch { await ctx.reply('state read error'); }
+});
+
+bot.command('reseed_off', async (ctx) => {
+  const st = loadState(); st.seeded = true; saveState(st);
+  await ctx.reply('Seeding disabled (seeded=true).');
 });
 
 // ----------------- START -----------------
@@ -411,42 +496,31 @@ bot.launch().then(async () => {
     await bot.telegram.setMyCommands([
       { command: 'ping', description: 'Ping the bot' },
       { command: 'health', description: 'Fetch market count' },
+      { command: 'whereami', description: 'Show current & target chat' },
+      { command: 'set_target', description: 'Set target chat id or "here"' },
+      { command: 'announce_open_now', description: 'Announce N open markets now' },
+      { command: 'state', description: 'Show tracked/announced counts' },
     ]);
   } catch {}
-  const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30); // min 5s
-  tick(); // run immediately
+  const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30);
+  tick(); // immediate run
   cron.schedule(`*/${interval} * * * * *`, tick);
 });
 
-// --- tiny HTTP server so Railway/hosts that expect $PORT don't kill the process ---
-import http from 'http';
-
-const PORT = process.env.PORT || 3000;
-
+// ----------------- TINY HTTP SERVER (keeps Railway/Render happy) -----------------
 const server = http.createServer(async (req, res) => {
   if (req.url === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    const state = (() => {
-      try { return JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf8')); }
-      catch { return { markets: {} }; }
-    })();
-    res.end(JSON.stringify({ ok: true, marketsTracked: Object.keys(state.markets || {}).length }));
+    const st = loadState();
+    const sum = summarizeState(st);
+    res.end(JSON.stringify({ ok: true, ...sum }));
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Auracle Telegram bot is running.\n');
 });
-
-server.listen(PORT, () => {
-  console.log(`[http] listening on :${PORT}`);
-});
+server.listen(PORT, () => console.log(`[http] listening on :${PORT}`));
 
 // ----------------- GRACEFUL SHUTDOWN -----------------
-process.once('SIGINT', async () => {
-  try { if (browser) await browser.close(); } catch {}
-  bot.stop('SIGINT');
-});
-process.once('SIGTERM', async () => {
-  try { if (browser) await browser.close(); } catch {}
-  bot.stop('SIGTERM');
-});
+process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });
+process.once('SIGTERM', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGTERM'); server.close(); });

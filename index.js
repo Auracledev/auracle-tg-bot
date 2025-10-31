@@ -744,68 +744,69 @@ bot.command('reseed_off', async (ctx) => {
   await ctx.reply('Seeding disabled (seeded=true).');
 });
 
-// ----------------- BOOT + SCHEDULERS -----------------
-async function setupSchedules() {
-  const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30);
-  console.log(`[cron] scheduling tick every ${interval}s (TZ=${TZ})`);
+// ----------------- START: robust scheduler -----------------
 
-  // immediate tick
-  tick();
-
-  // node-cron (seconds field)
-  const expr = `*/${interval} * * * * *`;
-  cron.schedule(expr, () => {
-    console.log(`[cron] tick firing @ ${new Date().toISOString()} via node-cron (${expr})`);
-    tick();
-  }, { timezone: TZ });
-
-  // fallback safety: setInterval
-  setInterval(() => {
-    console.log(`[cron-fallback] tick firing @ ${new Date().toISOString()} every ${interval}s`);
-    tick();
-  }, interval * 1000);
-}
-
-// launch bot + ALWAYS call setupSchedules (IIFE so it runs in all envs)
+// 1) Launch bot (polling), but don't gate scheduling on this
 (async () => {
   try {
     await bot.launch();
-    console.log('Bot started.');
+    console.log('[bot] started (polling).');
+    await bot.telegram.setMyCommands([
+      { command: 'ping', description: 'Ping the bot' },
+      { command: 'health', description: 'Active/Trending counts (titles from details)' },
+      { command: 'whereami', description: 'Show current & target chat' },
+      { command: 'set_target', description: 'Set target chat id or "here"' },
+      { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
+      { command: 'tick_now', description: 'Run a tick immediately' },
+      { command: 'state', description: 'Show tracked/announced counts' },
+    ]);
   } catch (e) {
-    console.error('bot.launch error:', e);
-  } finally {
-    // even if launch throws, still arm schedulers so we see logs
-    setupSchedules();
-    try {
-      await bot.telegram.setMyCommands([
-        { command: 'ping', description: 'Ping the bot' },
-        { command: 'health', description: 'Active/Trending counts (titles from details)' },
-        { command: 'whereami', description: 'Show current & target chat' },
-        { command: 'set_target', description: 'Set target chat id or "here"' },
-        { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
-        { command: 'tick_now', description: 'Run a tick immediately' },
-        { command: 'state', description: 'Show tracked/announced counts' },
-      ]);
-    } catch {}
+    console.error('[bot] launch error:', e?.message || e);
+    // keep going; scheduler runs regardless
   }
 })();
 
-// ----------------- TINY HTTP SERVER -----------------
+// 2) Heartbeat so logs show life every 10s
+setInterval(() => {
+  console.log(`[hb] alive @ ${new Date().toISOString()} uptime=${process.uptime().toFixed(1)}s`);
+}, 10_000);
+
+// 3) Self-rescheduling tick loop (no cron, no setInterval overlap)
+const intervalSec = Math.max(5, parseInt(process.env.POLL_INTERVAL_SECONDS || '30', 10));
+console.log(`[loop] arming self-scheduler every ${intervalSec}s`);
+
+async function loopTick() {
+  console.log(`[loop] fire @ ${new Date().toISOString()}`);
+  try {
+    await tick();
+  } catch (e) {
+    console.error('[loop] tick error:', e?.message || e);
+  } finally {
+    setTimeout(loopTick, intervalSec * 1000);
+  }
+}
+
+// kick off immediately
+loopTick();
+
+// 4) Tiny HTTP server (keeps container alive + quick status)
+import http from 'http';
 const server = http.createServer(async (req, res) => {
   if (req.url === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const st = loadState();
-    const sum = summarizeState(st);
-    res.end(JSON.stringify({ ok: true, ...sum, now: new Date().toISOString() }));
+    res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), ...summarizeState(st) }));
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Auracle Telegram bot is running.\n');
 });
-server.listen(PORT, () => console.log(`[http] listening on :${PORT}`));
+server.listen(process.env.PORT || 3000, () =>
+  console.log(`[http] listening on :${process.env.PORT || 3000}`)
+);
 
-// ----------------- GRACEFUL SHUTDOWN + ERR LOGS -----------------
-process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });
-process.once('SIGTERM', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGTERM'); server.close(); });
+// 5) Graceful shutdown + error traps
 process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
+process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });
+process.once('SIGTERM', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGTERM'); server.close(); });

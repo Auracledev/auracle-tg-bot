@@ -8,6 +8,7 @@ import puppeteer from 'puppeteer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ----------------- ENV -----------------
 const {
@@ -111,7 +112,7 @@ async function fetchMarkets({ debug = false } = {}) {
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
       await autoScroll(page);
-      await page.waitForTimeout(1000);
+      await sleep(1000);
 
       // collect up to 50 market links
       const links = await page.evaluate(() => {
@@ -166,7 +167,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
   await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
   await autoScroll(page);
-  await page.waitForTimeout(800);
+  await sleep(800);
 
   const data = await page.evaluate(() => {
     const text = (el) => (el?.textContent || '').trim();

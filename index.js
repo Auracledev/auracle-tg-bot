@@ -2,15 +2,14 @@ import 'dotenv/config';
 import * as fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import cron from 'node-cron';
 import { Telegraf } from 'telegraf';
 import puppeteer from 'puppeteer';
 import http from 'http';
 
+// ---------- Paths / Env ----------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ----------------- ENV -----------------
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
@@ -29,10 +28,10 @@ if (!TELEGRAM_BOT_TOKEN) {
   process.exit(1);
 }
 
-// ----------------- TELEGRAM -----------------
+// ---------- Telegram ----------
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// ----------------- STATE (persistent) -----------------
+// ---------- State ----------
 const STATE_DIR = path.resolve(DATA_DIR);
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -76,18 +75,16 @@ function setTargetChatId(id) {
   return id;
 }
 
-// ----------------- UTILS -----------------
+// ---------- Utils ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function escapeHtml(s = '') {
   return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
 
-// ----------------- PUPPETEER (singleton) -----------------
+// ---------- Puppeteer (singleton) ----------
 let browser = null;
 
 async function getBrowser() {
@@ -111,7 +108,7 @@ async function newPage() {
   const page = await b.newPage();
   await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) AuracleBot/1.0 Chrome/117 Safari/537.36');
   await page.setViewport({ width: 1280, height: 1024 });
-  await page.setCacheEnabled(false); // disable disk/mem cache
+  await page.setCacheEnabled(false); // disable cache to avoid edge caching
   return page;
 }
 async function autoScroll(page) {
@@ -133,18 +130,7 @@ async function autoScroll(page) {
   });
 }
 
-// ----------------- SCRAPERS -----------------
-function extractIdFromUrl(u) {
-  try {
-    const url = new URL(u);
-    const id = url.searchParams.get('id');
-    if (id) return id;
-  } catch {}
-  const m = u.match(/\/markets\/([^/?#]+)/i);
-  return m ? m[1] : null;
-}
-
-// List-page parser: HOT badge => trending; otherwise active. (No titles.)
+// ---------- List Scraper (Active vs Trending) ----------
 async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
   const now = Date.now();
@@ -240,6 +226,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           entries.push({ entry, trending });
         }
 
+        // Dedup by ID/URL
         const byKey = new Map();
         for (const { entry, trending } of entries) {
           const key = entry.id || entry.url;
@@ -267,7 +254,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
   return { trending: [], active: [] };
 }
 
-// Detail page with robust title + status detection
+// ---------- Detail Scraper ----------
 async function scrapeMarketDetail(url, { debug = false } = {}) {
   const page = await newPage();
   if (debug || dbg) console.log('[detail] goto', url);
@@ -407,7 +394,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
   return data;
 }
 
-// ----------------- MSG TEMPLATES (HTML) -----------------
+// ---------- Message Templates ----------
 function formatOptionsList(options = []) {
   if (!options.length) return '—';
   return options.map((o) =>
@@ -460,7 +447,7 @@ function fmtTrending(m) {
   ].join('\n');
 }
 
-// ----------------- TELEGRAM SEND (HTML) -----------------
+// ---------- Telegram send ----------
 async function send(msg, tag = '') {
   const chatId = getTargetChatId();
   try {
@@ -475,7 +462,7 @@ async function send(msg, tag = '') {
   }
 }
 
-// ----------------- TICK LOOP -----------------
+// ---------- Tick ----------
 async function tick() {
   try {
     console.log('[tick] run at', new Date().toISOString());
@@ -520,6 +507,7 @@ async function tick() {
       results.push(detail);
     }
 
+    // initial seed
     if (!state.seeded && results.length) {
       console.log('[seed] first run — seeding', results.length, 'markets');
       for (const m of results) {
@@ -546,10 +534,12 @@ async function tick() {
 
     console.log('[tick] scraped detail count:', results.length);
 
+    // update missing counters
     for (const id of Object.keys(state.markets)) {
       state.markets[id].missingCount = activeIds.has(id) ? 0 : ((state.markets[id].missingCount || 0) + 1);
     }
 
+    // transitions + announcements
     for (const m of results) {
       const prev = state.markets[m.id] || {
         announcedOpen: false, announcedClosed: false, announcedResolved: false,
@@ -568,6 +558,7 @@ async function tick() {
         };
       }
 
+      // infer closed if disappeared from Active (but still scraping open)
       if (!activeIds.has(m.id) && (prev.missingCount || 0) >= 1 && m.status === 'open') {
         console.log('[infer] CLOSED due to disappearance from Active:', m.id);
         m.status = 'closed';
@@ -638,7 +629,7 @@ async function tick() {
   }
 }
 
-// ----------------- COMMANDS -----------------
+// ---------- Commands ----------
 bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
 
 bot.command('health', async (ctx) => {
@@ -715,7 +706,6 @@ bot.command('announce_open_now', async (ctx) => {
   await ctx.reply(`Announced ${count} open market(s) to target chat.`);
 });
 
-// Manual tick trigger
 bot.command('tick_now', async (ctx) => {
   try {
     await ctx.reply('Tick started…');
@@ -744,9 +734,7 @@ bot.command('reseed_off', async (ctx) => {
   await ctx.reply('Seeding disabled (seeded=true).');
 });
 
-// ----------------- START: robust scheduler -----------------
-
-// 1) Launch bot (polling), but don't gate scheduling on this
+// ---------- Boot: bot + robust scheduler ----------
 (async () => {
   try {
     await bot.launch();
@@ -762,19 +750,17 @@ bot.command('reseed_off', async (ctx) => {
     ]);
   } catch (e) {
     console.error('[bot] launch error:', e?.message || e);
-    // keep going; scheduler runs regardless
   }
 })();
 
-// 2) Heartbeat so logs show life every 10s
+// Heartbeat every 10s
 setInterval(() => {
   console.log(`[hb] alive @ ${new Date().toISOString()} uptime=${process.uptime().toFixed(1)}s`);
 }, 10_000);
 
-// 3) Self-rescheduling tick loop (no cron, no setInterval overlap)
-const intervalSec = Math.max(5, parseInt(process.env.POLL_INTERVAL_SECONDS || '30', 10));
-console.log(`[loop] arming self-scheduler every ${intervalSec}s`);
-
+// Self-rescheduling loop (no cron)
+const intervalSec = Math.max(5, parseInt(POLL_INTERVAL_SECONDS || '30', 10));
+console.log(`[loop] arming self-scheduler every ${intervalSec}s (TZ=${TZ})`);
 async function loopTick() {
   console.log(`[loop] fire @ ${new Date().toISOString()}`);
   try {
@@ -785,12 +771,9 @@ async function loopTick() {
     setTimeout(loopTick, intervalSec * 1000);
   }
 }
+loopTick(); // kick off
 
-// kick off immediately
-loopTick();
-
-// 4) Tiny HTTP server (keeps container alive + quick status)
-import http from 'http';
+// ---------- HTTP server ----------
 const server = http.createServer(async (req, res) => {
   if (req.url === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -801,11 +784,9 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Auracle Telegram bot is running.\n');
 });
-server.listen(process.env.PORT || 3000, () =>
-  console.log(`[http] listening on :${process.env.PORT || 3000}`)
-);
+server.listen(PORT, () => console.log(`[http] listening on :${PORT}`));
 
-// 5) Graceful shutdown + error traps
+// ---------- Shutdown + error traps ----------
 process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });

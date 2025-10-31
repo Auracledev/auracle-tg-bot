@@ -161,6 +161,7 @@ function extractIdFromUrl(u) {
  * Section-aware classifier using HOT badges:
  * - If a card contains text like "#1 HOT", "#2 HOT", it's Trending
  * - Otherwise it's Active
+ * We ONLY return id/url and lightweight meta (no titles).
  */
 async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
@@ -185,10 +186,8 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
         const text = (el) => (el?.textContent || '').trim();
         const HAS_HOT = (node) => {
           if (!node) return false;
-          // Look for badges like "#1 HOT", "#2 HOT" inside this card/container
-          const candidates = Array.from(node.querySelectorAll('*:not(script):not(style)'))
-            .slice(0, 500); // safety
-          for (const n of candidates) {
+          const nodes = Array.from(node.querySelectorAll('*:not(script):not(style)')).slice(0, 500);
+          for (const n of nodes) {
             const t = (n.textContent || '').toUpperCase();
             if (/#\s*\d+\s*HOT/.test(t)) return true;
           }
@@ -196,48 +195,28 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
         };
 
         const anchors = Array.from(document.querySelectorAll('a[href*="MarketDetails?id="], a[href*="/markets/"]'));
-        const seen = new Set();
+        const seenUrls = new Set();
         const entries = [];
 
         for (const a of anchors) {
           const href = a.getAttribute('href') || '';
           const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
-          if (seen.has(abs)) continue;
-          seen.add(abs);
+          if (seenUrls.has(abs)) continue;
+          seenUrls.add(abs);
 
-          // Card root
           const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
-          // Scoped title near percent rows
-          const pickTitle = (node) => {
-            if (!node) return '';
-            const pctNode = node.querySelector('[data-testid="option-percent"], .option-percent, .percentage, .percent');
-            let scope = node;
-            if (pctNode) {
-              const block = pctNode.closest('article, section, div');
-              if (block) scope = block;
-            }
-            return (
-              text(scope.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"]')) ||
-              text(scope.querySelector('strong')) || ''
-            );
-          };
-
-          let title =
-            pickTitle(cardRoot) ||
-            text(cardRoot?.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"], strong')) || '';
-
+          // meta we keep (no titles)
           const category =
             text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
 
-          // Ends-in (best-effort)
           let endsIn = '';
           const smalls = Array.from(cardRoot?.querySelectorAll('time, .text-xs, .text-sm, [data-testid="ends-in"], .ends-in') || [])
             .map(el => text(el));
           const endsCand = smalls.find(t => /in\b.*(hour|day|minute|about)/i.test(t) || /about/i.test(t));
           if (endsCand) endsIn = endsCand;
 
-          // Options + %
+          // Try to snapshot options for open
           const rowSelectors = [
             '.option', '.side', '.row',
             '.left, .center, .right',
@@ -270,32 +249,37 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             if (options.length >= 3) break;
           }
 
-          // ID
+          // Extract ID
           let id = null;
           try {
             const u = new URL(abs);
             id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
           } catch {}
 
-          const entry = { id, url: abs, title, category, endsIn, options, status: 'open' };
-          // Classify by HOT badge presence
+          const entry = { id, url: abs, title: '', category, endsIn, options, status: 'open' };
           const trending = HAS_HOT(cardRoot);
           entries.push({ entry, trending });
         }
 
-        // Split into buckets
-        const trending = [];
-        const active = [];
-        for (const { entry, trending: isHot } of entries) {
-          if (isHot) trending.push(entry); else active.push(entry);
+        // Dedup by ID/URL
+        const byKey = new Map();
+        for (const { entry, trending } of entries) {
+          const key = entry.id || entry.url;
+          if (!byKey.has(key)) byKey.set(key, { entry, trending });
         }
 
-        // Fallback safety: if everything detected as trending (or none as active), assume active = all
-        if (active.length === 0 && trending.length > 0) {
-          return { trending: [], active: trending };
+        const trendingArr = [];
+        const activeArr = [];
+        for (const { entry, trending } of byKey.values()) {
+          if (trending) trendingArr.push(entry); else activeArr.push(entry);
         }
 
-        return { trending, active };
+        // Fallback: if everything looked trending, treat them as active
+        if (activeArr.length === 0 && trendingArr.length > 0) {
+          return { trending: [], active: trendingArr };
+        }
+
+        return { trending: trendingArr, active: activeArr };
       });
 
       await page.close();
@@ -370,7 +354,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
         options = rows.map((row, i) => {
           const label = text(row.querySelector(labelSelectors)) || `Option ${i+1}`;
           const pct = getPctFromNode(row.querySelector(percentSelectors));
-          return { label, pct: Number.isFinite(pct) ? pct : null };
+          return { label, pct: Number.isFinite(pct) ? Math.round(pct) : null };
         }).filter(o => o.label || o.pct !== null);
         if (options.length >= 2) break;
       }
@@ -476,7 +460,7 @@ async function tick() {
   try {
     if (dbg) console.log('[tick] run at', new Date().toISOString());
 
-    // 1) Read sections via HOT-badge classifier
+    // 1) Read sections (IDs/URLs only) via HOT-badge classifier
     const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
 
     const activeIds   = new Set(active.map(m => m.id).filter(Boolean));
@@ -506,12 +490,14 @@ async function tick() {
       const detail = await scrapeMarketDetail(url, { debug: dbg });
       if (!detail || !detail.id) continue;
 
-      // Merge richer list data when OPEN (prefer Active card)
-      if (detail.status === 'open' && activeById.has(detail.id)) {
-        const card = activeById.get(detail.id);
-        detail.category = card.category || detail.category;
-        detail.endsIn   = card.endsIn   || detail.endsIn;
-        if (Array.isArray(card.options) && card.options.length >= 2) detail.options = card.options;
+      // Merge richer list meta when OPEN (prefer Active card)
+      if (detail.status === 'open') {
+        const card = activeById.get(detail.id) || trendingById.get(detail.id);
+        if (card) {
+          detail.category = card.category || detail.category;
+          detail.endsIn   = card.endsIn   || detail.endsIn;
+          if (Array.isArray(card.options) && card.options.length >= 2) detail.options = card.options;
+        }
       }
 
       results.push(detail);
@@ -557,7 +543,7 @@ async function tick() {
       };
       const next = { ...prev, url: m.url };
 
-      // Keep lastSeen fresh while OPEN (prefer Active card)
+      // Keep lastSeen fresh while OPEN (prefer Active card, title from detail)
       if (m.status === 'open') {
         const card = activeById.get(m.id) || trendingById.get(m.id);
         const seenOpts = card?.options?.length ? card.options : m.options;
@@ -569,7 +555,7 @@ async function tick() {
         };
       }
 
-      // Infer CLOSED if gone from Active for >=2 ticks but detail says open
+      // Infer CLOSED if gone from Active for >=1 prior tick but detail says open
       if (!activeIds.has(m.id) && (prev.missingCount || 0) >= 1 && m.status === 'open') {
         if (dbg) console.log('[infer] CLOSED due to disappearance from Active:', m.id);
         m.status = 'closed';
@@ -648,12 +634,29 @@ async function tick() {
 // ----------------- COMMANDS -----------------
 bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
 
+// Health uses details to show real titles (no dupes)
 bot.command('health', async (ctx) => {
   try {
     const { trending, active } = await fetchMarketsFromSections({ debug: true });
-    const sampleA = active.slice(0,2).map(c => c.title || '(no title)').join(' | ') || '—';
-    const sampleT = trending.slice(0,2).map(c => c.title || '(no title)').join(' | ') || '—';
-    await ctx.reply(`Active: ${active.length}  |  Trending: ${trending.length}\nActive sample: ${sampleA}\nTrending sample: ${sampleT}`);
+
+    const aSample = await Promise.all(
+      active.slice(0,2).map(async (c) => {
+        const d = await scrapeMarketDetail(c.url, { debug: false });
+        return (d?.title || '(no title)').toUpperCase();
+      })
+    );
+    const tSample = await Promise.all(
+      trending.slice(0,2).map(async (c) => {
+        const d = await scrapeMarketDetail(c.url, { debug: false });
+        return (d?.title || '(no title)').toUpperCase();
+      })
+    );
+
+    await ctx.reply(
+      `Active: ${active.length}  |  Trending: ${trending.length}\n` +
+      `Active sample: ${aSample.join(' | ') || '—'}\n` +
+      `Trending sample: ${tSample.join(' | ') || '—'}`
+    );
   } catch (e) {
     await ctx.reply(`Fetch failed: ${String(e.message || e).slice(0, 300)}`);
   }
@@ -682,13 +685,12 @@ bot.command('announce_open_now', async (ctx) => {
   const { active } = await fetchMarketsFromSections({ debug: false });
   let count = 0;
   for (const card of active.slice(0, limit)) {
-    // Pull detail to truth-source the title
     const detail = await scrapeMarketDetail(card.url, { debug: dbg });
     const merged = {
       ...card,
       id: card.id || detail?.id,
       url: detail?.url || card.url,
-      title: (detail?.title || card.title || 'Unknown').toUpperCase(),
+      title: (detail?.title || 'Unknown').toUpperCase(),
       options: (card.options?.length ? card.options : detail?.options || [])
     };
     await send(fmtNewMarket(merged), 'OPEN(TEST)');
@@ -732,7 +734,7 @@ bot.launch().then(async () => {
   try {
     await bot.telegram.setMyCommands([
       { command: 'ping', description: 'Ping the bot' },
-      { command: 'health', description: 'Active/Trending counts' },
+      { command: 'health', description: 'Active/Trending counts (titles from details)' },
       { command: 'whereami', description: 'Show current & target chat' },
       { command: 'set_target', description: 'Set target chat id or "here"' },
       { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },

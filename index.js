@@ -15,13 +15,15 @@ const {
   TELEGRAM_CHAT_ID,
   AURACLE_BASE_URL = 'https://auracle.fi',
   POLL_INTERVAL_SECONDS = '30',
-  DATA_DIR = '/data', // Railway volume (Storage -> Add Volume -> mount at /data)
+  DATA_DIR = '/data', // On Render, mount a disk here; during local dev, you can set ./data
+  DEBUG, // set to "1" to see verbose logs
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error('Missing env vars: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID');
   process.exit(1);
 }
+const dbg = !!DEBUG;
 
 // ----------------- TELEGRAM -----------------
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -42,8 +44,15 @@ async function getBrowser() {
   if (browser) return browser;
   browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--single-process',
+    ],
   });
+  if (dbg) console.log('[puppeteer] launched');
   return browser;
 }
 
@@ -62,7 +71,8 @@ async function autoScroll(page) {
       let total = 0;
       const distance = 800;
       const timer = setInterval(() => {
-        const { scrollTop, scrollHeight, clientHeight } = document.scrollingElement || document.documentElement;
+        const doc = document.scrollingElement || document.documentElement;
+        const { scrollTop, scrollHeight, clientHeight } = doc;
         window.scrollBy(0, distance);
         total += distance;
         if (scrollTop + clientHeight >= scrollHeight - 2 || total > 20000) {
@@ -82,21 +92,44 @@ async function autoScroll(page) {
  *   title: string,
  *   url: string,
  *   status: "open" | "closed" | "resolved",
- *   options: Array<{ label: string, pct: number|null }>,   // 2 or 3 (e.g., includes "Draw")
+ *   options: Array<{ label: string, pct: number|null }>,   // 2 or 3 (e.g., includes "Draw"); supports more
  *   winner: string|null                                     // label of winning option when resolved
  * }
  */
-async function fetchMarkets() {
-  // try /markets first, then /Markets (in case of capitalized route)
+async function fetchMarkets({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
   const candidates = [`${base}/markets`, `${base}/Markets`];
 
   for (const url of candidates) {
     try {
       const page = await newPage();
+      if (debug || dbg) console.log('[markets] goto', url);
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-      // Wait for any likely container; tolerate different classnames
+      // PROBE: are there any useful links at all?
+      const probe = await page.evaluate(() => {
+        const a = Array.from(document.querySelectorAll('a[href]'))
+          .map((el) => el.getAttribute('href'))
+          .filter(Boolean);
+        const marketLinks = a.filter((h) => /\/markets\//i.test(h) || /MarketDetails/i.test(h));
+        return { totalLinks: a.length, marketLinks: marketLinks.slice(0, 10) };
+      });
+      if (debug || dbg) console.log('[probe]', probe);
+
+      if (!probe.marketLinks.length) {
+        await autoScroll(page);
+        await page.waitForTimeout(1500);
+        const probe2 = await page.evaluate(() => {
+          const a = Array.from(document.querySelectorAll('a[href]'))
+            .map((el) => el.getAttribute('href'))
+            .filter(Boolean);
+          const marketLinks = a.filter((h) => /\/markets\//i.test(h) || /MarketDetails/i.test(h));
+          return { totalLinks: a.length, marketLinks: marketLinks.slice(0, 10) };
+        });
+        if (debug || dbg) console.log('[probe2]', probe2);
+      }
+
+      // WAIT for likely containers
       const readySelectors = [
         '.market-card',
         '[data-market-id]',
@@ -110,27 +143,30 @@ async function fetchMarkets() {
           await page.waitForSelector(sel, { timeout: 8000 });
           ready = true;
           break;
-        } catch { /* keep looping */ }
+        } catch {}
       }
-
       if (!ready) {
-        // Try scroll + wait again (virtualized content)
         await autoScroll(page);
         for (const sel of readySelectors) {
           try {
             await page.waitForSelector(sel, { timeout: 4000 });
             ready = true;
             break;
-          } catch { /* keep looping */ }
+          } catch {}
         }
       }
-
       if (!ready) {
+        if (debug || dbg) {
+          const bodySnippet = await page.evaluate(
+            () => document.body?.innerText?.slice(0, 500) || ''
+          );
+          console.log('[markets] no selectors matched. body snippet:', bodySnippet);
+        }
         await page.close();
         continue; // try next candidate URL
       }
 
-      // Ensure content is fully loaded
+      // Ensure virtualized lists render
       await autoScroll(page);
 
       const markets = await page.evaluate(() => {
@@ -141,26 +177,29 @@ async function fetchMarkets() {
           return Number.isFinite(n) ? Math.round(n) : null;
         };
 
-        // Common lists of option containers (A/B[/C]) we might see
         const optionRowSelectors = [
-          '.option',                // generic
-          '.side',                  // side-a / side-b / side-c
+          '.option', '.side',
           '.option-a, .option-b, .option-c',
           '.side-a, .side-b, .side-c',
-          '.left, .right, .center', // layout-based
+          '.left, .right, .center',
         ];
 
-        // Gather card elements OR fallback to links
-        const cardNodes = Array.from(document.querySelectorAll('.market-card, [data-market-id], .card-market'));
+        const cardNodes = Array.from(
+          document.querySelectorAll('.market-card, [data-market-id], .card-market')
+        );
         const linkNodes = cardNodes.length
           ? []
-          : Array.from(document.querySelectorAll('a[href*="/markets/"], a[href*="/MarketDetails"]'));
+          : Array.from(
+              document.querySelectorAll('a[href*="/markets/"], a[href*="/MarketDetails"]')
+            );
 
         const nodes = cardNodes.length ? cardNodes : linkNodes;
 
         const out = nodes.map((el) => {
           const isLink = el.tagName?.toLowerCase() === 'a';
-          const hrefEl = isLink ? el : el.querySelector?.('a[href*="/markets/"], a[href*="/MarketDetails"]');
+          const hrefEl = isLink
+            ? el
+            : el.querySelector?.('a[href*="/markets/"], a[href*="/MarketDetails"]');
           const href = hrefEl ? hrefEl.getAttribute('href') : null;
 
           // id from data-* or from href
@@ -168,9 +207,7 @@ async function fetchMarkets() {
             el.getAttribute?.('data-id') ||
             el.getAttribute?.('data-market-id') ||
             null;
-
           if (!id && href) {
-            // /markets/<slug> OR /MarketDetails?id=<id>
             let m = href.match(/\/markets\/([^/?#]+)/i);
             if (!m) m = href.match(/[?&]id=([^&#]+)/i);
             if (m) id = m[1];
@@ -199,63 +236,80 @@ async function fetchMarkets() {
             status = 'closed';
           }
 
-          // ---- options (2 or 3) ----
+          // ---- options (2, 3, or more) ----
           let options = [];
 
           // Try structured rows first
           for (const sel of optionRowSelectors) {
             const rows = Array.from(el.querySelectorAll?.(sel) || []);
             if (rows.length >= 2) {
-              options = rows.map((row) => {
-                const label =
-                  text(row.querySelector('.label, .name, .team, .option-label')) ||
-                  text(row.querySelector('strong, span'));
-                const pct =
-                  getPct(row.querySelector('.percent, .percentage, .progress-label, .option-percent'));
-                return { label: label || '', pct: Number.isFinite(pct) ? pct : null };
-              }).filter(o => o.label || o.pct !== null);
-
+              options = rows
+                .map((row) => {
+                  const label =
+                    text(
+                      row.querySelector('.label, .name, .team, .option-label')
+                    ) || text(row.querySelector('strong, span'));
+                  const pct = getPct(
+                    row.querySelector(
+                      '.percent, .percentage, .progress-label, .option-percent'
+                    )
+                  );
+                  return {
+                    label: label || '',
+                    pct: Number.isFinite(pct) ? pct : null,
+                  };
+                })
+                .filter((o) => o.label || o.pct !== null);
               if (options.length >= 2) break;
             }
           }
 
-          // Fallback: grab first 2–3 labels + percents anywhere inside card
+          // Fallback: first 2–3 labels + percents anywhere inside card
           if (options.length < 2) {
-            const labels = Array.from(el.querySelectorAll?.('.label, .name, .team') || [])
+            const labels = Array.from(
+              el.querySelectorAll?.('.label, .name, .team') || []
+            )
               .map((n) => text(n))
               .filter(Boolean)
               .slice(0, 3);
-            const percNodes = Array.from(el.querySelectorAll?.('.percent, .percentage, .progress-label') || [])
-              .slice(0, 3);
+            const percNodes = Array.from(
+              el.querySelectorAll?.('.percent, .percentage, .progress-label') || []
+            ).slice(0, 3);
             const pcts = percNodes.map(getPct);
             const len = Math.max(labels.length, pcts.length);
             if (len >= 2) {
               options = Array.from({ length: len }).map((_, i) => ({
                 label: labels[i] || (i === 2 ? 'Draw' : `Option ${i + 1}`),
-                pct: Number.isFinite(pcts[i]) ? pcts[i] : null
+                pct: Number.isFinite(pcts[i]) ? pcts[i] : null,
               }));
             }
           }
 
           // If exactly 2 options and only one pct given, infer the other as (100 - x)
           if (options.length === 2) {
-            const a = options[0], b = options[1];
-            if (a.pct != null && (b.pct == null)) b.pct = 100 - a.pct;
-            if (b.pct != null && (a.pct == null)) a.pct = 100 - b.pct;
+            const a = options[0],
+              b = options[1];
+            if (a.pct != null && b.pct == null) b.pct = 100 - a.pct;
+            if (b.pct != null && a.pct == null) a.pct = 100 - b.pct;
           }
 
           // Clamp/clean percentages
-          options = options.map(o => ({
+          options = options.map((o) => ({
             label: o.label || 'Option',
-            pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
+            pct:
+              o.pct != null && o.pct >= 0 && o.pct <= 100
+                ? Math.round(o.pct)
+                : null,
           }));
 
-          // winner (when resolved) — try explicit, then by class, else null
+          // winner (when resolved)
           let winner =
-            text(el.querySelector?.('.winner .name, .winner, .result-winner')) || null;
-
+            text(el.querySelector?.('.winner .name, .winner, .result-winner')) ||
+            null;
           if (!winner) {
-            const winNode = el.querySelector?.('.option.winner, .side.winner, .option-a.winner, .option-b.winner, .option-c.winner');
+            const winNode = el.querySelector?.(
+              '.option.winner, .side.winner, .option-a.winner, .option-b.winner, .option-c.winner'
+            );
             if (winNode) {
               const wlabel =
                 text(winNode.querySelector('.label, .name, .team')) ||
@@ -270,7 +324,14 @@ async function fetchMarkets() {
               : href || location.href;
 
           return id && title && absoluteUrl
-            ? { id, title, url: absoluteUrl, status, options, winner: winner || null }
+            ? {
+                id,
+                title,
+                url: absoluteUrl,
+                status,
+                options,
+                winner: winner || null,
+              }
             : null;
         });
 
@@ -278,10 +339,11 @@ async function fetchMarkets() {
       });
 
       await page.close();
+      if (debug || dbg) console.log('[markets] fetched', markets.length, 'from', url);
       if (markets.length) return markets;
-      // If empty, try next candidate URL
     } catch (err) {
-      console.error(`fetchMarkets error for ${url}:`, err.message);
+      if (debug || dbg) console.error(`[fetchMarkets] ${url} ->`, err.message);
+      // try next candidate url
     }
   }
 
@@ -293,11 +355,10 @@ function escapeMd(s = '') {
   // Escape for Telegram MarkdownV2
   return s.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
 }
-
 function formatOptionsList(options = []) {
   // e.g., "Home: 45% | Draw: 12% | Away: 43%"
   if (!options.length) return '—';
-  const parts = options.map(o => `${escapeMd(o.label)}: *${o.pct ?? '?'}%*`);
+  const parts = options.map((o) => `${escapeMd(o.label)}: *${o.pct ?? '?'}%*`);
   return parts.join('  |  ');
 }
 
@@ -309,7 +370,6 @@ function fmtNewMarket(m) {
     `🔗 ${m.url}`,
   ].join('\n');
 }
-
 function fmtClosed(m) {
   return [
     '🛑 *Market Closed — Final Pool*',
@@ -319,7 +379,6 @@ function fmtClosed(m) {
     `🔗 ${m.url}`,
   ].join('\n');
 }
-
 function fmtResolved(m) {
   return [
     '✅ *Market Resolved*',
@@ -346,15 +405,17 @@ async function send(msg) {
 // ----------------- POLLING TICK -----------------
 async function tick() {
   try {
-    const markets = await fetchMarkets();
+    if (dbg) console.log('[tick] run at', new Date().toISOString());
+    const markets = await fetchMarkets({ debug: dbg });
     const state = loadState();
 
     for (const m of markets) {
-      const prev = state.markets[m.id] || {
-        announcedOpen: false,
-        announcedClosed: false,
-        announcedResolved: false,
-      };
+      const prev =
+        state.markets[m.id] || {
+          announcedOpen: false,
+          announcedClosed: false,
+          announcedResolved: false,
+        };
       const next = { ...prev };
 
       if (m.status === 'open' && !prev.announcedOpen) {
@@ -374,6 +435,7 @@ async function tick() {
     }
 
     saveState(state);
+    if (dbg) console.log('[tick] done. markets seen:', markets.length);
   } catch (e) {
     console.error('tick error:', e.message);
   }
@@ -383,16 +445,33 @@ async function tick() {
 bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
 bot.command('health', async (ctx) => {
   try {
-    const markets = await fetchMarkets();
-    await ctx.reply(`OK. Found ${markets.length} markets.`);
+    const markets = await fetchMarkets({ debug: true });
+    if (!markets.length) {
+      await ctx.reply(
+        'Fetched 0 markets (debug on). Check logs for [probe] and [markets] entries — selectors may need tweaking.'
+      );
+    } else {
+      const sample = markets
+        .slice(0, 3)
+        .map((m) => m.title)
+        .join(' | ');
+      await ctx.reply(`OK. Found ${markets.length} markets.\nSample: ${sample || '—'}`);
+    }
   } catch (e) {
-    await ctx.reply(`Fetch failed: ${e.message}`);
+    await ctx.reply(`Fetch failed: ${String(e.message || e).slice(0, 300)}`);
   }
 });
 
 // ----------------- START -----------------
-bot.launch().then(() => {
+bot.launch().then(async () => {
   console.log('Bot started.');
+  try {
+    // (Nice to have) set commands for autocomplete
+    await bot.telegram.setMyCommands([
+      { command: 'ping', description: 'Ping the bot' },
+      { command: 'health', description: 'Fetch market count' },
+    ]);
+  } catch {}
   const interval = Math.max(5, parseInt(POLL_INTERVAL_SECONDS, 10) || 30); // min 5s
   tick(); // run immediately
   cron.schedule(`*/${interval} * * * * *`, tick);
@@ -400,10 +479,14 @@ bot.launch().then(() => {
 
 // ----------------- GRACEFUL SHUTDOWN -----------------
 process.once('SIGINT', async () => {
-  try { if (browser) await browser.close(); } catch {}
+  try {
+    if (browser) await browser.close();
+  } catch {}
   bot.stop('SIGINT');
 });
 process.once('SIGTERM', async () => {
-  try { if (browser) await browser.close(); } catch {}
+  try {
+    if (browser) await browser.close();
+  } catch {}
   bot.stop('SIGTERM');
 });

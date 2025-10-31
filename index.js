@@ -157,7 +157,11 @@ function extractIdFromUrl(u) {
   return m ? m[1] : null;
 }
 
-// Section-aware /Markets scraper: returns { trending, active }
+/**
+ * Section-aware classifier using HOT badges:
+ * - If a card contains text like "#1 HOT", "#2 HOT", it's Trending
+ * - Otherwise it's Active
+ */
 async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
   const listCandidates = [`${base}/Markets`, `${base}/markets`];
@@ -168,117 +172,128 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
       if (debug || dbg) console.log('[sections] goto', url);
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
+      // Wait for any market links and scroll to load lazy content
       try {
         await page.waitForFunction(
           () => !!document.querySelector('a[href*="MarketDetails?id="], a[href*="/markets/"]'),
           { timeout: 20000 }
         );
       } catch {}
-
       for (let i = 0; i < 10; i++) { await autoScroll(page); await sleep(400); }
 
       const data = await page.evaluate(() => {
         const text = (el) => (el?.textContent || '').trim();
-        const up = (s) => (s || '').toUpperCase();
-
-        const allBlocks = Array.from(document.querySelectorAll('section, div'));
-        const findSectionByHeading = (needle) => {
-          const block = allBlocks.find(b => {
-            const h = b.querySelector('h2, h3, .section-title, .title');
-            return h && up(h.textContent).includes(needle);
-          });
-          return block || document.body;
-        };
-
-        const trendingRoot = findSectionByHeading('TRENDING AURACLES');
-        const activeRoot   = findSectionByHeading('ACTIVE AURACLES');
-
-        const parseCardsWithin = (root) => {
-          const results = [];
-          const anchors = Array.from(root.querySelectorAll('a[href*="MarketDetails?id="], a[href*="/markets/"]'));
-          const seen = new Set();
-
-          for (const a of anchors) {
-            const href = a.getAttribute('href') || '';
-            const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
-            if (seen.has(abs)) continue;
-            seen.add(abs);
-
-            const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
-
-            // Scoped title: look near percent rows inside same card
-            const pickTitle = (node) => {
-              if (!node) return '';
-              const pctNode = node.querySelector('[data-testid="option-percent"], .option-percent, .percentage, .percent');
-              let scope = node;
-              if (pctNode) {
-                const block = pctNode.closest('article, section, div');
-                if (block) scope = block;
-              }
-              return (
-                text(scope.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"]')) ||
-                text(scope.querySelector('strong')) || ''
-              );
-            };
-
-            let title =
-              pickTitle(cardRoot) ||
-              text(cardRoot?.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"], strong')) || '';
-
-            const category =
-              text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
-
-            let endsIn = '';
-            const smalls = Array.from(cardRoot?.querySelectorAll('time, .text-xs, .text-sm, [data-testid="ends-in"], .ends-in') || [])
-              .map(el => text(el));
-            const endsCand = smalls.find(t => /in\b.*(hour|day|minute|about)/i.test(t) || /about/i.test(t));
-            if (endsCand) endsIn = endsCand;
-
-            const rowSelectors = [
-              '.option', '.side', '.row',
-              '.left, .center, .right',
-              '[data-option]', '[role="listitem"]',
-              '.market-option', '.market-side'
-            ].join(',');
-
-            const labelSel = [
-              '.label', '.name', '.team', '.option-label',
-              '[data-testid="option-label"]', '[data-testid="option-name"]',
-              'strong', 'span', 'p'
-            ].join(',');
-
-            const pctSel = [
-              '.percent', '.percentage', '.progress-label', '.option-percent',
-              '[data-testid="option-percent"]'
-            ].join(',');
-
-            const options = [];
-            const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
-            for (const row of rows) {
-              const pctNode = row.querySelector(pctSel);
-              const lblNode = row.querySelector(labelSel);
-              if (!pctNode || !lblNode) continue;
-              const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
-              const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
-              const label = text(lblNode);
-              if (!label || pct === null) continue;
-              options.push({ label, pct });
-              if (options.length >= 3) break;
-            }
-
-            let id = null;
-            try {
-              const u = new URL(abs);
-              id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
-            } catch {}
-
-            results.push({ id, url: abs, title, category, endsIn, options, status: 'open' });
+        const HAS_HOT = (node) => {
+          if (!node) return false;
+          // Look for badges like "#1 HOT", "#2 HOT" inside this card/container
+          const candidates = Array.from(node.querySelectorAll('*:not(script):not(style)'))
+            .slice(0, 500); // safety
+          for (const n of candidates) {
+            const t = (n.textContent || '').toUpperCase();
+            if (/#\s*\d+\s*HOT/.test(t)) return true;
           }
-          return results;
+          return false;
         };
 
-        const trending = parseCardsWithin(trendingRoot);
-        const active   = parseCardsWithin(activeRoot);
+        const anchors = Array.from(document.querySelectorAll('a[href*="MarketDetails?id="], a[href*="/markets/"]'));
+        const seen = new Set();
+        const entries = [];
+
+        for (const a of anchors) {
+          const href = a.getAttribute('href') || '';
+          const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
+          if (seen.has(abs)) continue;
+          seen.add(abs);
+
+          // Card root
+          const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
+
+          // Scoped title near percent rows
+          const pickTitle = (node) => {
+            if (!node) return '';
+            const pctNode = node.querySelector('[data-testid="option-percent"], .option-percent, .percentage, .percent');
+            let scope = node;
+            if (pctNode) {
+              const block = pctNode.closest('article, section, div');
+              if (block) scope = block;
+            }
+            return (
+              text(scope.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"]')) ||
+              text(scope.querySelector('strong')) || ''
+            );
+          };
+
+          let title =
+            pickTitle(cardRoot) ||
+            text(cardRoot?.querySelector('h3, h2, .title, .market-title, [data-testid="card-title"], strong')) || '';
+
+          const category =
+            text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
+
+          // Ends-in (best-effort)
+          let endsIn = '';
+          const smalls = Array.from(cardRoot?.querySelectorAll('time, .text-xs, .text-sm, [data-testid="ends-in"], .ends-in') || [])
+            .map(el => text(el));
+          const endsCand = smalls.find(t => /in\b.*(hour|day|minute|about)/i.test(t) || /about/i.test(t));
+          if (endsCand) endsIn = endsCand;
+
+          // Options + %
+          const rowSelectors = [
+            '.option', '.side', '.row',
+            '.left, .center, .right',
+            '[data-option]', '[role="listitem"]',
+            '.market-option', '.market-side'
+          ].join(',');
+
+          const labelSel = [
+            '.label', '.name', '.team', '.option-label',
+            '[data-testid="option-label"]', '[data-testid="option-name"]',
+            'strong', 'span', 'p'
+          ].join(',');
+
+          const pctSel = [
+            '.percent', '.percentage', '.progress-label', '.option-percent',
+            '[data-testid="option-percent"]'
+          ].join(',');
+
+          const options = [];
+          const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
+          for (const row of rows) {
+            const pctNode = row.querySelector(pctSel);
+            const lblNode = row.querySelector(labelSel);
+            if (!pctNode || !lblNode) continue;
+            const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
+            const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
+            const label = text(lblNode);
+            if (!label || pct === null) continue;
+            options.push({ label, pct });
+            if (options.length >= 3) break;
+          }
+
+          // ID
+          let id = null;
+          try {
+            const u = new URL(abs);
+            id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
+          } catch {}
+
+          const entry = { id, url: abs, title, category, endsIn, options, status: 'open' };
+          // Classify by HOT badge presence
+          const trending = HAS_HOT(cardRoot);
+          entries.push({ entry, trending });
+        }
+
+        // Split into buckets
+        const trending = [];
+        const active = [];
+        for (const { entry, trending: isHot } of entries) {
+          if (isHot) trending.push(entry); else active.push(entry);
+        }
+
+        // Fallback safety: if everything detected as trending (or none as active), assume active = all
+        if (active.length === 0 && trending.length > 0) {
+          return { trending: [], active: trending };
+        }
 
         return { trending, active };
       });
@@ -461,7 +476,7 @@ async function tick() {
   try {
     if (dbg) console.log('[tick] run at', new Date().toISOString());
 
-    // 1) Read sections
+    // 1) Read sections via HOT-badge classifier
     const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
 
     const activeIds   = new Set(active.map(m => m.id).filter(Boolean));
@@ -547,7 +562,7 @@ async function tick() {
         const card = activeById.get(m.id) || trendingById.get(m.id);
         const seenOpts = card?.options?.length ? card.options : m.options;
         next.lastSeen = {
-          title: m.title, // truth-source from detail page title to avoid duplicates
+          title: m.title, // truth-source from detail page title
           category: card?.category ?? m.category,
           endsIn: card?.endsIn ?? m.endsIn,
           options: Array.isArray(seenOpts) ? seenOpts : (prev.lastSeen?.options || [])

@@ -102,6 +102,45 @@ function humanizeEta(targetMs, nowMs = Date.now()) {
   return `in about moments`;
 }
 
+// Collapse duplicate option rows like "LEVERKUSEN 50%" repeated.
+// Keeps first occurrence per label (case-insensitive), up to 3 total.
+function uniqueOptions(options = []) {
+  const out = [];
+  const seen = new Set();
+  for (const o of options) {
+    if (!o || !o.label) continue;
+    const key = o.label.trim().toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ label: o.label.trim(), pct: (Number.isFinite(o.pct)? Math.round(o.pct) : null) });
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
+// Map a raw winner string to the actual option label (YES/NO/DRAW → team names)
+// Falls back to raw winner if no mapping found. Treats INVALID/VOID specially.
+function mapWinnerToLabel(winnerRaw, options = []) {
+  const raw = (winnerRaw || '').trim();
+  if (!raw) return null;
+  const W = raw.toUpperCase();
+
+  // If the resolved text already includes the team/choice name, use that.
+  for (const o of options) {
+    if (!o?.label) continue;
+    if (W.includes(o.label.toUpperCase())) return o.label;
+  }
+  // YES/NO/DRAW to indexed choices
+  if (/^YES\b/i.test(W))  return options[0]?.label || "YES";
+  if (/^NO\b/i.test(W))   return options[1]?.label || "NO";
+  if (/^DRAW\b/i.test(W)) return options[2]?.label || "Draw";
+
+  // Special cases
+  if (/INVALID|VOID/i.test(W)) return "Invalid";
+
+  return raw;
+}
+
 // ---------- Puppeteer (singleton) ----------
 let browser = null;
 
@@ -264,10 +303,23 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
           } catch {}
 
-          const entry = { id, url: abs, title: '', category, endsIn, options, status: 'open' };
-          const trending = HAS_HOT(cardRoot);
-          entries.push({ entry, trending });
-        }
+// << add this line right after options collection for the card >>
+options = uniqueOptions(options);
+          
+// Dedupe repeated label rows (e.g., "LEVERKUSEN 50%" shown multiple times on the card)
+const cleanOptions = (Array.isArray(options) ? options : []);
+const entry = {
+  id,
+  url: abs,
+  title: '',
+  category,
+  endsIn,
+  options: cleanOptions.length ? cleanOptions.slice(0, 5) : [],
+  status: 'open'
+};
+
+const trending = HAS_HOT(cardRoot);
+entries.push({ entry, trending });
 
         // Dedup by ID/URL
         const byKey = new Map();
@@ -596,8 +648,9 @@ function fmtResolved(m) {
 }
 function fmtTrending(m) {
   const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
-  const lines = (m.options || []).slice(0,3).map(
-    o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`
+  const uniq = uniqueOptions(m.options || []);
+  const lines = uniq.slice(0,3).map(
+    o => `• ${escapeHtml(o.label)} — <b>${o.pct ?? '?'}%</b>`
   ).join('\n');
   return [
     '📈 <b>Now Trending on Auracle</b>',
@@ -776,16 +829,29 @@ async function tick() {
         next.announcedClosed = true;
       }
 
-      if (m.status === 'resolved' && !prev.announcedResolved) {
-        const finalOptions =
-          next.closedSnapshot?.options?.length ? next.closedSnapshot.options
-            : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);
-        const resolvedPayload = { ...m, options: finalOptions, title: m.title || prev.lastSeen?.title || 'Unknown' };
-        await send(fmtResolved(resolvedPayload), 'RESOLVED');
+if (m.status === 'resolved' && !prev.announcedResolved) {
+  // Prefer the snapshot taken at close; else lastSeen; else whatever we have on page.
+  let finalOptions =
+    (next.closedSnapshot && Array.isArray(next.closedSnapshot.options) && next.closedSnapshot.options.length) ? next.closedSnapshot.options
+      : (prev.lastSeen && Array.isArray(prev.lastSeen.options) && prev.lastSeen.options.length ? prev.lastSeen.options
+      : (Array.isArray(m.options) ? m.options : []));
 
-        next.announcedResolved = true;
-        next.retired = true;     // ✅ stop tracking this market forever
-      }
+  finalOptions = uniqueOptions(finalOptions);
+
+  // Map “YES/NO/DRAW” to actual label (e.g., "BOSTON CELTICS")
+  const mappedWinner = mapWinnerToLabel(m.winner, finalOptions) || m.winner || '—';
+
+  const resolvedPayload = {
+    ...m,
+    winner: mappedWinner,
+    options: finalOptions,
+    title: m.title || prev.lastSeen?.title || 'Unknown'
+  };
+
+  await send(fmtResolved(resolvedPayload), 'RESOLVED');
+  next.announcedResolved = true;
+  next.retired = true;     // stop tracking
+}
 
       // Trending enter
       const isTrendingNow = trendingIds.has(m.id);

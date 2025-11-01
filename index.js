@@ -1,466 +1,416 @@
-/**  AURACLE TELEGRAM BOT — FINAL BUILD w/ EMOJIS ✅ **/
+/**
+ * Auracle Telegram Bot — Stable Build
+ * Features:
+ * ✅ Scrape open markets
+ * ✅ Announce new markets
+ * ✅ Announce closed markets with final %s
+ * ✅ Announce resolved markets with winner name + %
+ * ✅ Deduplicate + retire after resolve
+ * ✅ Auto-seed so no first-boot spam
+ * ✅ Emoji by sport
+ * ✅ Robust tick loop w/ setInterval
+ */
 
 import 'dotenv/config';
-import * as fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { Telegraf } from 'telegraf';
-import puppeteer from 'puppeteer';
-import http from 'http';
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import puppeteer from "puppeteer";
+import http from "http";
+import { Telegraf } from "telegraf";
 
-/****************************
- ENV + PATHS
-*****************************/
+/* ============================= ENV / PATH ============================= */
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
-  AURACLE_BASE_URL = 'https://auracle.fi',
-  POLL_INTERVAL_SECONDS = '30',
-  DATA_DIR = '/data',
+  AURACLE_BASE_URL = "https://auracle.fi",
+  POLL_INTERVAL_SECONDS = "30",
+  DATA_DIR = "/data",
   DEBUG,
-  PORT = process.env.PORT || 3000,
-  TZ = process.env.TZ || 'UTC'
+  PORT = process.env.PORT || 8080
 } = process.env;
 
 if (!TELEGRAM_BOT_TOKEN) {
-  console.error('Missing TELEGRAM_BOT_TOKEN');
+  console.error("❌ Missing TELEGRAM_BOT_TOKEN");
   process.exit(1);
 }
 
 const dbg = !!DEBUG;
 
-/****************************
- TELEGRAM INIT
-*****************************/
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+/* ============================= STATE FILE ============================= */
 
-/****************************
- STATE FILE
-*****************************/
 const STATE_DIR = path.resolve(DATA_DIR);
-const STATE_FILE = path.join(STATE_DIR, 'state.json');
+const STATE_FILE = path.join(STATE_DIR, "state.json");
 
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
 if (!fs.existsSync(STATE_FILE)) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify({ markets: {}, seeded: false }, null, 2));
+  fs.writeFileSync(
+    STATE_FILE,
+    JSON.stringify({ markets: {}, seeded: false }, null, 2)
+  );
 }
 
 const loadState = () => {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); }
-  catch { return { markets: {}, seeded:false }; }
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return { markets: {}, seeded: false };
+  }
 };
-const saveState = (s) => fs.writeFileSync(STATE_FILE, JSON.stringify(s,null,2));
+
+const saveState = (s) =>
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
 
 const getTargetChatId = () => loadState().targetChatId || TELEGRAM_CHAT_ID;
-const setTargetChatId = (id) => { const st=loadState(); st.targetChatId=id; saveState(st); return id; };
+const setTargetChatId = (id) => {
+  const st = loadState();
+  st.targetChatId = id;
+  saveState(st);
+};
 
-/****************************
- UTILS
-*****************************/
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+/* ============================= TELEGRAM ============================= */
 
-function escapeHtml(s=''){
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+
+function escapeHtml(s = "") {
   return s
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
-    .replace(/'/g,'&#39;');
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-function humanizeEta(targetMs, nowMs = Date.now()){
-  if(!Number.isFinite(targetMs))return'';
-  let diff=Math.max(0,Math.floor((targetMs-nowMs)/1000));
-  const min=Math.floor(diff/60), hr=Math.floor(min/60),day=Math.floor(hr/24);
-  if(day>=2) return `in about ${day} days`;
-  if(day===1) return `in about 1 day`;
-  if(hr>=2) return `in about ${hr} hours`;
-  if(hr===1) return `in about 1 hour`;
-  if(min>=2) return `in about ${min} minutes`;
-  if(min===1) return `in about 1 minute`;
-  return 'in about moments';
+async function send(msg) {
+  const chatId = getTargetChatId();
+  try {
+    await bot.telegram.sendMessage(chatId, msg, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+  } catch (e) {
+    console.error("send error", e?.response?.description || e.message);
+  }
 }
 
-/****************************
- EMOJI DETECTOR 🎯
-*****************************/
-function detectEmoji(title='', category='') {
-  const t=(title||'').toLowerCase();
-  const c=(category||'').toLowerCase();
+/* ============================= EMOJI DETECTOR ============================= */
 
-  if(/(fc|united|city|madrid|barcelona|dortmund|liverpool|arsenal|juventus|serie a|bundesliga|premier|la liga)/.test(t)) return '⚽';
-  if(/nba|lakers|celtics|bulls|warriors|76ers|spurs/.test(t)) return '🏀';
-  if(/nfl|patriots|chiefs|eagles|cowboys|steelers/.test(t)) return '🏈';
-  if(/mlb|dodgers|yankees|mets|blue jays/.test(t)) return '⚾';
-  if(/nhl|bruins|rangers|penguins/.test(t)) return '🏒';
-  if(/ufc|fight|mma|ko|tk o|octagon/.test(t)) return '🥊';
-  if(/btc|eth|sol|crypto|token|coin/.test(t)) return '₿';
-  if(/csgo|valorant|league of legends|esports|gaming/.test(t)) return '🎮';
-  return '🎯';
+function detectEmoji(title = "", category = "") {
+  const t = (title + " " + category).toLowerCase();
+  if (/fc|united|city|madrid|barcelona|psg|dortmund|liverpool|arsenal|premier|bundesliga/.test(t)) return "⚽";
+  if (/nba|lakers|celtics|warriors|76ers|knicks|bucks/.test(t)) return "🏀";
+  if (/nfl|patriots|chiefs|eagles|cowboys|steelers/.test(t)) return "🏈";
+  if (/mlb|dodgers|yankees|blue jays|mets/.test(t)) return "⚾";
+  if (/ufc|mma|fight/.test(t)) return "🥊";
+  if (/btc|eth|sol|crypto/.test(t)) return "₿";
+  return "🎯";
 }
 
-/****************************
- PUPPETEER
-*****************************/
-let browser=null;
+/* ============================= BROWSER ============================= */
 
-async function getBrowser(){
-  if(browser) return browser;
+let browser = null;
+async function getBrowser() {
+  if (browser) return browser;
   browser = await puppeteer.launch({
-    headless:'new',
-    args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
   return browser;
 }
-
-async function newPage(){
+async function newPage() {
   const b = await getBrowser();
-  const p = await b.newPage();
-  await p.setUserAgent('Mozilla/5.0 AuracleBot/1.0');
-  return p;
+  return b.newPage();
 }
 
-async function autoScroll(page){
-  await page.evaluate(async()=>{
-    await new Promise(resolve=>{
-      let total=0;
-      const dist=800;
-      const t=setInterval(()=>{
-        window.scrollBy(0,dist);
-        total+=dist;
-        if(total>20000){clearInterval(t);resolve();}
-      },250);
-    });
-  });
-}
+/* ============================= SCRAPERS ============================= */
 
-/****************************
- LIST SCRAPER (Active / Trending)
-*****************************/
-async function fetchMarketsFromSections(){
-  const base=AURACLE_BASE_URL.replace(/\/+$/,'');
-  const urls=[`${base}/Markets?ts=${Date.now()}`,`${base}/markets?ts=${Date.now()}`];
+async function fetchMarketsList() {
+  const url = `${AURACLE_BASE_URL}/Markets?ts=${Date.now()}`;
+  const page = await newPage();
+  await page.goto(url, { waitUntil: "networkidle2" });
 
-  for(const url of urls){
-    try{
-      const p=await newPage();
-      await p.goto(url,{waitUntil:'networkidle2',timeout:60000});
-      await autoScroll(p);
+  const data = await page.evaluate(() => {
+    const pick = (n) => (n?.textContent || "").trim();
+    const links = Array.from(document.querySelectorAll('a[href*="MarketDetails?id"]'));
 
-      const data = await p.evaluate(()=>{
-        const text = el=> (el?.textContent||'').trim();
+    const out = { active: [], trending: [] };
 
-        const nodes=Array.from(document.querySelectorAll('a[href*="MarketDetails?id"]'));
-        const list={active:[],trending:[]};
+    function isTrending(el) {
+      return /#\s*\d+\s*HOT/.test(el.innerText.toUpperCase());
+    }
 
-        function isTrendingCard(el){
-          return /#\s*\d+\s*HOT/.test(el.innerText.toUpperCase());
-        }
+    for (const a of links) {
+      const id = new URL(a.href).searchParams.get("id");
+      if (!id) continue;
 
-        for(const a of nodes){
-          const url=a.href;
-          const id = new URL(url).searchParams.get('id');
-          if(!id) continue;
+      const card = a.closest("article,div") || a.parentElement;
 
-          const card=a.closest('article,div')||a.parentElement;
-          const category = text(card?.querySelector('.badge,.chip,.category'));
-          const options=[];
-          const rows=Array.from(card?.querySelectorAll('.option,.side,[data-option]')||[]);
-          for(const r of rows){
-            const lbl=text(r?.querySelector('.label,.team,.option-label'));
-            const p=r?.querySelector('.percent,.percentage'); 
-            if(lbl&&p){
-              const pct=parseInt(p.textContent.replace('%',''));
-              if(Number.isFinite(pct)) options.push({label:lbl,pct});
-            }
-          }
+      const category = pick(card?.querySelector(".badge,.chip,.category"));
+      const options = [];
 
-          const entry={id,url,title:'',category,options,status:'open'};
-          if(isTrendingCard(card)) list.trending.push(entry);
-          else list.active.push(entry);
-        }
-        return list;
+      const rows = card?.querySelectorAll(".option,.side,[data-option]");
+      rows && rows.forEach(r => {
+        const lbl = pick(r.querySelector(".label,.team,.option-label"));
+        const pctEl = r.querySelector(".percent,.percentage");
+        const pct = pctEl ? parseInt(pctEl.textContent.replace("%","")) : null;
+        if (lbl && pct != null) options.push({ label: lbl, pct });
       });
 
-      await p.close();
-      return data;
-    }catch{}
-  }
-  return {active:[],trending:[]};
-}
+      const entry = { id, url: a.href, title: pick(card?.querySelector("h3,.title")), category, options };
 
-/****************************
- DETAIL SCRAPER
-*****************************/
-async function scrapeMarketDetail(url){
-  const p=await newPage();
-  await p.goto(url,{waitUntil:'networkidle2',timeout:60000});
-  await autoScroll(p);
-
-  const d = await p.evaluate(()=>{
-    const text=el=>(el?.textContent||'').trim();
-    const up=s=>(s||'').toUpperCase();
-    const pageRaw=(document.body?.innerText||'');
-
-    // title
-    let title='';
-    const og=document.querySelector('meta[property="og:title"]')?.content;
-    if(og) title=og.trim();
-    if(!title){
-      const h=document.querySelector('h1,h2,.title');
-      title=text(h);
+      if (isTrending(card)) out.trending.push(entry)
+      else out.active.push(entry);
     }
 
-    // winner / status
-    const upTxt=up(pageRaw);
-    let status='open';
-    let winner=null;
-    if(upTxt.includes('ORACLE CLOSED')) status='closed';
-    const m=pageRaw.match(/ORACLE RESOLVED:\s*(.+)$/mi);
-    if(m){ status='resolved'; winner=m[1].trim(); }
-
-    // options extraction: try multiple heuristics
-    const getPct=node=>{
-      if(!node) return null;
-      const s=(node.textContent||'').replace('%','').replace(/[^\d.]/g,'');
-      const n=parseFloat(s);
-      return Number.isFinite(n)?Math.round(n):null;
-    };
-
-    const options=[];
-
-    // live rows
-    const rows=document.querySelectorAll('.option,.side,[data-option]');
-    for(const r of rows){
-      const lbl=text(r.querySelector('.label,.team,.option-label,span,strong'));
-      const pct=getPct(r.querySelector('.percent,.percentage'));
-      if(lbl&&pct!=null) options.push({label:lbl,pct});
-    }
-
-    // fallback CURRENT blocks when closed
-    const rawNodes=Array.from(document.querySelectorAll('*'));
-    for(const el of rawNodes){
-      const t=el.textContent.toUpperCase();
-      const m=t.match(/CURRENT\s+(.+?)\s+(\d+)\s*%/);
-      if(m){
-        const pct=parseInt(m[2]);
-        if(Number.isFinite(pct)) options.push({label:m[1].trim(),pct});
-      }
-    }
-
-    // fallback IMPLIED
-    for(const el of rawNodes){
-      const t=(el.textContent||'');
-      const m=t.match(/^(.+?)\s+IMPLIED.*?(\d+)\s*%/i);
-      if(m){
-        const pct=parseInt(m[2]);
-        if(Number.isFinite(pct)) options.push({label:m[1].trim(),pct});
-      }
-    }
-
-    // dedupe
-    const seen=new Set();
-    const finalOpts=[];
-    for(const o of options){
-      const k=o.label+'_'+o.pct;
-      if(!seen.has(k)){finalOpts.push(o); seen.add(k);}
-      if(finalOpts.length>=3) break;
-    }
-
-    // close time
-    let closeISO='', closeText='';
-    const body=pageRaw.replace(/\s+/g,' ');
-    const dt=body.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\s+at\s+\d{1,2}:\d{2}\s*(AM|PM)/i);
-    if(dt){
-      const d=new Date(dt[0]);
-      if(!isNaN(d.getTime())){closeISO=d.toISOString(); closeText=dt[0];}
-    }
-
-    const id = new URL(location.href).searchParams.get('id');
-
-    return {id,url:location.href,title,status,winner,options:finalOpts,closeISO,closeText};
+    return out;
   });
 
-  await p.close();
+  await page.close();
+  return data;
+}
+
+async function scrapeMarketDetail(url) {
+  const page = await newPage();
+  await page.goto(url, { waitUntil: "networkidle2" });
+  const text = (x) => (x?.textContent || "").trim();
+
+  const d = await page.evaluate(() => {
+    const t = (x) => (x?.textContent || "").trim();
+    const raw = document.body.innerText.toUpperCase();
+
+    let title = document.querySelector("h1,h2,.title")?.textContent?.trim() || "";
+    if (!title) {
+      const og = document.querySelector('meta[property="og:title"]')?.content;
+      if (og) title = og.trim();
+    }
+
+    let status = "open";
+    let winner = null;
+    if (raw.includes("ORACLE CLOSED")) status = "closed";
+    const m = raw.match(/ORACLE RESOLVED:\s*(.+)$/mi);
+    if (m) { status = "resolved"; winner = m[1].trim(); }
+
+    const options = [];
+    const rows = document.querySelectorAll(".option,.side,[data-option]");
+    rows && rows.forEach(r => {
+      const lbl = t(r.querySelector(".label,.team,.option-label,span,strong"));
+      const pctEl = r.querySelector(".percent,.percentage");
+      if (lbl && pctEl) {
+        const pct = parseInt(pctEl.textContent.replace("%",""));
+        if (Number.isFinite(pct)) options.push({label:lbl,pct});
+      }
+    });
+
+    const id = new URL(location.href).searchParams.get("id");
+
+    // close time
+    let closeISO = "";
+    const body = document.body.innerText;
+    const dt = body.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\s+at\s+\d{1,2}:\d{2}/i);
+    if (dt) {
+      const d = new Date(dt[0]);
+      if (!isNaN(d.getTime())) closeISO = d.toISOString();
+    }
+
+    return { id, url: location.href, title, status, winner, options, closeISO };
+  });
+
+  await page.close();
   return d;
 }
 
-/****************************
- MESSAGE TEMPLATES
-*****************************/
-function fmtNew(m){
-  const emoji=detectEmoji(m.title,m.category);
-  const lines=(m.options||[]).slice(0,3).map(o=>`• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`).join('\n');
-  return `🔥 <b>New Market Live</b>\n${emoji} <b>${escapeHtml(m.title)}</b>\n⏳ ${escapeHtml(m.endsIn||'Soon')}\n${lines}\n🔗 ${m.url}`;
+/* ============================= HUMAN TIME ============================= */
+
+function humanizeEta(targetMs) {
+  if (!Number.isFinite(targetMs)) return "";
+  const diff = Math.max(0, Math.floor((targetMs - Date.now())/1000));
+  const min = Math.floor(diff/60), hr = Math.floor(min/60), day = Math.floor(hr/24);
+  if (day>=2) return `in about ${day} days`;
+  if (day===1) return `in about 1 day`;
+  if (hr>=2) return `in about ${hr} hours`;
+  if (hr===1) return `in about 1 hour`;
+  if (min>=2) return `in about ${min} minutes`;
+  if (min===1) return `in about 1 minute`;
+  return "soon";
 }
 
-function fmtClosed(m){
-  const list=(m.options||[]).map(o=>`${escapeHtml(o.label)} ${o.pct}%`).join(' - ')||'—';
-  const emoji=detectEmoji(m.title,m.category);
-  return `🛑 <b>Market Closed — Final Pool</b>\n${emoji} <b>${escapeHtml(m.title)}</b>\n📊 ${list}\n👀 Awaiting resolution…\n🔗 ${m.url}`;
+/* ============================= FORMATTING ============================= */
+
+function fmtNew(m) {
+  const emoji = detectEmoji(m.title,m.category);
+  const lines = (m.options||[]).slice(0,3).map(o=>`• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`).join("\n");
+  return `🔥 <b>New Market Live</b>
+${emoji} <b>${escapeHtml(m.title)}</b>
+⏳ ${escapeHtml(m.endsIn||"soon")}
+${lines}
+🔗 ${m.url}`;
 }
 
-function fmtResolved(m){
-  const list=(m.options||[]).map(o=>`${escapeHtml(o.label)}: <b>${o.pct}%</b>`).join(' | ')||'—';
-  const emoji=detectEmoji(m.title,m.category);
-  return `✅ <b>Market Resolved</b>\n${emoji} <b>${escapeHtml(m.title)}</b>\n🏆 Winner: <b>${escapeHtml(m.winner)}</b>\n📊 Final: ${list}\n💰 Rewards live on Auracle\n🔗 ${m.url}`;
+function fmtClosed(m) {
+  const emoji = detectEmoji(m.title,m.category);
+  const list = (m.options||[]).map(o=>`${escapeHtml(o.label)} ${o.pct}%`).join(" - ")||"—";
+  return `🛑 <b>Market Closed — Final Pool</b>
+${emoji} <b>${escapeHtml(m.title)}</b>
+📊 ${list}
+👀 Awaiting resolution…
+🔗 ${m.url}`;
 }
 
-/****************************
- SEND TO TELEGRAM
-*****************************/
-async function send(msg){
-  const chatId=getTargetChatId();
-  try{
-    await bot.telegram.sendMessage(chatId,msg,{parse_mode:'HTML',disable_web_page_preview:true});
-  }catch(e){console.error('send error',e.response?.description||e.message);}
+function fmtResolved(m) {
+  const emoji = detectEmoji(m.title,m.category);
+  const list = (m.options||[]).map(o=>`${escapeHtml(o.label)}: <b>${o.pct}%</b>`).join(" | ")||"—";
+  return `✅ <b>Market Resolved</b>
+${emoji} <b>${escapeHtml(m.title)}</b>
+🏆 Winner: <b>${escapeHtml(m.winner)}</b>
+📊 Final: ${list}
+💰 Rewards live on Auracle
+🔗 ${m.url}`;
 }
 
-/****************************
- MAIN TICK
-*****************************/
-async function tick(){
-  console.log('[tick]',new Date().toISOString());
+/* ============================= TICK ============================= */
 
-  const {active,trending}=await fetchMarketsFromSections();
-  const activeIds=new Set(active.map(m=>m.id));
-  const trendingIds=new Set(trending.map(m=>m.id));
+async function tick() {
+  const start = Date.now();
+  console.log("[tick] START", new Date().toISOString());
 
-  let state=loadState();
-  const knownIds=new Set(Object.keys(state.markets));
+  const { active, trending } = await fetchMarketsList();
+  console.log(`[tick] list → active ${active.length}, trending ${trending.length}`);
 
-  const toWatch=new Set([...activeIds,...trendingIds,...knownIds]);
-  for(const id of [...toWatch]) if(state.markets[id]?.retired) toWatch.delete(id);
+  const ids = new Set([...active, ...trending].map(m=>m.id));
+  const state = loadState();
+  const known = new Set(Object.keys(state.markets));
+  const all = new Set([...ids, ...known]);
 
-  const base=AURACLE_BASE_URL.replace(/\/+$/,'');
-  const results=[];
-  for(const id of toWatch){
-    const rec=state.markets[id];
-    const card=active.find(x=>x.id===id)||trending.find(x=>x.id===id);
-    const url=rec?.url || card?.url || `${base}/MarketDetails?id=${id}`;
-
-    const detail=await scrapeMarketDetail(url);
-    if(!detail) continue;
-
-    if(detail.status==='open'){
-      if(detail.closeISO){
-        const ms=Date.parse(detail.closeISO);
-        if(Number.isFinite(ms)) detail.endsIn=humanizeEta(ms);
-      } else if(card?.endsIn) detail.endsIn=card.endsIn;
-      detail.category=card?.category||detail.category;
-      if(card?.options?.length>=2) detail.options=card.options;
-    }
-
-    results.push(detail);
-  }
-
-  if(!state.seeded && results.length){
-    for(const m of results){
-      state.markets[m.id]={
-        announcedOpen:false,announcedClosed:false,announcedResolved:false,
-        lastStatus:m.status,url:m.url,retired:m.status==='resolved',
-        lastSeen:{title:m.title,category:m.category,endsIn:m.endsIn,options:m.options},
-        closedSnapshot:m.status==='closed'?{options:m.options}:null
+  /* first boot seed */
+  if (!state.seeded && all.size) {
+    console.log("[seed] seeding first scrape", all.size);
+    for (const m of [...active, ...trending]) {
+      state.markets[m.id] = {
+        announcedOpen: true,
+        announcedClosed: m.status==="closed",
+        announcedResolved: m.status==="resolved",
+        lastStatus: "open",
+        url: m.url,
+        retired: m.status==="resolved",
+        lastSeen: { title:m.title, category:m.category, options:m.options }
       };
     }
-    state.seeded=true;
+    state.seeded = true;
     saveState(state);
+    console.log("[seed] done — no announcements");
     return;
   }
 
-  for(const m of results){
-    const prev=state.markets[m.id]||{};
-    const next={...prev,url:m.url,retired:prev.retired||false};
+  /* detail scrape each watched */
+  for (const id of all) {
+    const rec = state.markets[id] || {};
+    if (rec.retired) continue;
 
-    if(prev.retired){ state.markets[m.id]=next; continue; }
+    const card = active.find(x=>x.id===id) || trending.find(x=>x.id===id);
+    const url = rec.url || card?.url || `${AURACLE_BASE_URL}/MarketDetails?id=${id}`;
 
-    if(m.status==='open'){
-      next.lastSeen={title:m.title,category:m.category,endsIn:m.endsIn,options:m.options};
+    const detail = await scrapeMarketDetail(url);
+
+    // track lastSeen
+    if (!state.markets[id]) state.markets[id] = {};
+    const m = state.markets[id];
+
+    if (detail.status === "open") {
+      if (detail.closeISO) {
+        const ms = Date.parse(detail.closeISO);
+        if (!isNaN(ms)) detail.endsIn = humanizeEta(ms);
+      }
+      m.lastSeen = {
+        title: detail.title,
+        category: detail.category,
+        endsIn: detail.endsIn,
+        options: detail.options
+      };
     }
 
-    if(m.status==='closed' && !next.closedSnapshot){
-      next.closedSnapshot={options:(prev.lastSeen?.options?.length?prev.lastSeen.options:m.options)||[]};
+    /* OPEN announcement */
+    if (detail.status==="open" && !m.announcedOpen) {
+      const opts = detail.options?.length ? detail.options : m.lastSeen?.options;
+      await send(fmtNew({...detail,options:opts}));
+      m.announcedOpen = true;
     }
 
-    // OPEN announcement
-    if(m.status==='open' && !prev.announcedOpen){
-      await send(fmtNew({...m,options:(m.options?.length?m.options:prev.lastSeen?.options)}));
-      next.announcedOpen=true;
+    /* CLOSED announcement */
+    if (detail.status==="closed" && !m.announcedClosed) {
+      const opts = detail.options?.length
+        || m.lastSeen?.options?.length
+        ? (detail.options || m.lastSeen.options)
+        : [];
+      m.closedSnapshot = { options: opts };
+      await send(fmtClosed({...detail,options:opts}));
+      m.announcedClosed = true;
     }
 
-    // CLOSED announcement
-    if(m.status==='closed' && !prev.announcedClosed && prev.lastStatus!=='closed'){
-      const closedOpts=(next.closedSnapshot?.options?.length && next.closedSnapshot.options)
-        || (prev.lastSeen?.options?.length && prev.lastSeen.options)
-        || (m.options?.length && m.options) || [];
-      await send(fmtClosed({...m,options:closedOpts}));
-      next.announcedClosed=true;
+    /* RESOLVED announcement */
+    if (detail.status==="resolved" && !m.announcedResolved) {
+      const finalOpts = m.closedSnapshot?.options?.length
+        ? m.closedSnapshot.options
+        : (m.lastSeen?.options || detail.options || []);
+
+      let win = detail.winner;
+      const lower = (win||"").toLowerCase();
+      if (lower.includes("yes") && finalOpts[0]?.label) win = finalOpts[0].label;
+      if (lower.includes("no")  && finalOpts[1]?.label) win = finalOpts[1].label;
+
+      await send(fmtResolved({...detail, winner:win, options:finalOpts}));
+      m.announcedResolved = true;
+      m.retired = true;
     }
 
-    // RESOLVED announcement + YES/NO → real team fix
-    if(m.status==='resolved' && !prev.announcedResolved){
-      const finalOpts=(next.closedSnapshot?.options?.length && next.closedSnapshot.options)
-        || (prev.lastSeen?.options?.length && prev.lastSeen.options)
-        || (m.options?.length && m.options) || [];
-
-      let winName = m.winner;
-      const lower=String(winName||'').toLowerCase();
-      if(lower.includes('yes') && finalOpts[0]?.label) winName=finalOpts[0].label;
-      if(lower.includes('no')  && finalOpts[1]?.label) winName=finalOpts[1].label;
-
-      await send(fmtResolved({...m,winner:winName,options:finalOpts}));
-      next.announcedResolved=true;
-      next.retired=true;
-    }
-
-    next.lastStatus=m.status;
-    state.markets[m.id]=next;
-  }
-
-  // state prune
-  const ids=Object.keys(state.markets);
-  if(ids.length>2000){
-    for(const id of ids){
-      if(state.markets[id]?.retired) delete state.markets[id];
-    }
+    m.lastStatus = detail.status;
+    m.url = url;
   }
 
   saveState(state);
+  console.log("[tick] END", new Date().toISOString(), "elapsed", Date.now()-start, "ms");
 }
 
-/****************************
- COMMANDS
-*****************************/
-bot.command('ping',ctx=>ctx.reply('pong ✅'));
-bot.command('tick_now',async(ctx)=>{await ctx.reply('manual tick…');await tick();await ctx.reply('done ✅');});
-bot.command('whereami',ctx=>ctx.reply(`Target: ${getTargetChatId()}\nHere: ${ctx.chat.id}\n/set_target here`));
-bot.command('set_target',(ctx)=>{
-  const [,arg]=ctx.message.text.split(' ');
-  if(!arg) return ctx.reply('Usage: /set_target <chatId|here>');
-  const id=(arg==='here')?ctx.chat.id:arg;
+/* ============================= COMMANDS ============================= */
+
+bot.command("ping", ctx=>ctx.reply("pong ✅"));
+bot.command("tick_now", async ctx=>{
+  await ctx.reply("manual tick running…");
+  await tick();
+  await ctx.reply("done ✅");
+});
+bot.command("whereami", ctx=>ctx.reply(`Target: ${getTargetChatId()}\nHere: ${ctx.chat.id}\n/set_target here`));
+bot.command("set_target", ctx=>{
+  const [,arg] = ctx.message.text.split(" ");
+  if (!arg) return ctx.reply("Usage: /set_target <chatId|here>");
+  const id = arg==="here" ? ctx.chat.id : arg;
   setTargetChatId(id);
-  ctx.reply(`✅ Set target to ${id}`);
+  ctx.reply(`✅ Target set: ${id}`);
 });
 
-/****************************
- LOOP + SERVER
-*****************************/
-setInterval(()=>console.log(`[hb] ${new Date().toISOString()}`),10000);
+/* ============================= LOOP ============================= */
 
-async function loopTick(){
-  await tick();
-  setTimeout(loopTick,Math.max(5,parseInt(POLL_INTERVAL_SECONDS))*1000);
-}
-loopTick();
+const intervalSec = Math.max(8, parseInt(POLL_INTERVAL_SECONDS||"30",10));
 
-const server=http.createServer((req,res)=>{
-  if(req.url==='/status'){
-    res.writeHead(200,{'Content-Type':'application/json'});
-    return res.end(JSON.stringify({ok:true,ts:new Date().toISOString()}));
+async function safeTickOnce() {
+  try {
+    await tick();
+  } catch(e) {
+    console.error("[loop] tick error", e?.stack||e);
   }
-  res.end('Auracle bot running ✅');
+}
+
+safeTickOnce();
+setInterval(safeTickOnce, intervalSec*1000);
+
+setInterval(()=>console.log("[hb]", new Date().toISOString()), 10000);
+
+/* ============================= SERVER + LAUNCH ============================= */
+const server = http.createServer((_,res)=>{
+  res.writeHead(200,{"Content-Type":"application/json"});
+  res.end(JSON.stringify({ ok:true, ts:new Date().toISOString() }));
 });
 server.listen(PORT,()=>console.log(`[HTTP] :${PORT}`));
-
 bot.launch();
+console.log("✅ Bot running");

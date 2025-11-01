@@ -1,416 +1,282 @@
-/**
- * Auracle Telegram Bot — Stable Build
- * Features:
- * ✅ Scrape open markets
- * ✅ Announce new markets
- * ✅ Announce closed markets with final %s
- * ✅ Announce resolved markets with winner name + %
- * ✅ Deduplicate + retire after resolve
- * ✅ Auto-seed so no first-boot spam
- * ✅ Emoji by sport
- * ✅ Robust tick loop w/ setInterval
- */
+// ─────────────────────────────────────────────────────────
+// Auracle Telegram Bot — with Trending Alerts
+// Version: trending-v1
+// ─────────────────────────────────────────────────────────
 
-import 'dotenv/config';
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import puppeteer from "puppeteer";
+import fetch from "node-fetch";
+import fs from "fs";
 import http from "http";
-import { Telegraf } from "telegraf";
 
-/* ============================= ENV / PATH ============================= */
+const BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN";
+const CHAT_ID = "YOUR_TELEGRAM_CHAT_ID";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const AURACLE_BASE = "https://auracle.fi";
+const POLL_INTERVAL_MS = 30000; // 30s
 
-const {
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID,
-  AURACLE_BASE_URL = "https://auracle.fi",
-  POLL_INTERVAL_SECONDS = "30",
-  DATA_DIR = "/data",
-  DEBUG,
-  PORT = process.env.PORT || 8080
-} = process.env;
+// State file
+const STATE_FILE = "./state.json";
+let state = loadState();
 
-if (!TELEGRAM_BOT_TOKEN) {
-  console.error("❌ Missing TELEGRAM_BOT_TOKEN");
-  process.exit(1);
-}
-
-const dbg = !!DEBUG;
-
-/* ============================= STATE FILE ============================= */
-
-const STATE_DIR = path.resolve(DATA_DIR);
-const STATE_FILE = path.join(STATE_DIR, "state.json");
-
-if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
-if (!fs.existsSync(STATE_FILE)) {
-  fs.writeFileSync(
-    STATE_FILE,
-    JSON.stringify({ markets: {}, seeded: false }, null, 2)
-  );
-}
-
-const loadState = () => {
+// ─────────────────────────────────────────────
+// Load / Save State
+// ─────────────────────────────────────────────
+function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {
-    return { markets: {}, seeded: false };
+    return { markets: {} };
   }
-};
-
-const saveState = (s) =>
-  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
-
-const getTargetChatId = () => loadState().targetChatId || TELEGRAM_CHAT_ID;
-const setTargetChatId = (id) => {
-  const st = loadState();
-  st.targetChatId = id;
-  saveState(st);
-};
-
-/* ============================= TELEGRAM ============================= */
-
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
-
-function escapeHtml(s = "") {
-  return s
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
+function saveState() {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// ─────────────────────────────────────────────
+// Telegram Send Helper
+// ─────────────────────────────────────────────
 async function send(msg) {
-  const chatId = getTargetChatId();
-  try {
-    await bot.telegram.sendMessage(chatId, msg, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    });
-  } catch (e) {
-    console.error("send error", e?.response?.description || e.message);
-  }
-}
-
-/* ============================= EMOJI DETECTOR ============================= */
-
-function detectEmoji(title = "", category = "") {
-  const t = (title + " " + category).toLowerCase();
-  if (/fc|united|city|madrid|barcelona|psg|dortmund|liverpool|arsenal|premier|bundesliga/.test(t)) return "⚽";
-  if (/nba|lakers|celtics|warriors|76ers|knicks|bucks/.test(t)) return "🏀";
-  if (/nfl|patriots|chiefs|eagles|cowboys|steelers/.test(t)) return "🏈";
-  if (/mlb|dodgers|yankees|blue jays|mets/.test(t)) return "⚾";
-  if (/ufc|mma|fight/.test(t)) return "🥊";
-  if (/btc|eth|sol|crypto/.test(t)) return "₿";
-  return "🎯";
-}
-
-/* ============================= BROWSER ============================= */
-
-let browser = null;
-async function getBrowser() {
-  if (browser) return browser;
-  browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      chat_id: CHAT_ID,
+      text: msg,
+      parse_mode: "Markdown"
+    })
   });
-  return browser;
-}
-async function newPage() {
-  const b = await getBrowser();
-  return b.newPage();
 }
 
-/* ============================= SCRAPERS ============================= */
-
-async function fetchMarketsList() {
-  const url = `${AURACLE_BASE_URL}/Markets?ts=${Date.now()}`;
-  const page = await newPage();
-  await page.goto(url, { waitUntil: "networkidle2" });
-
-  const data = await page.evaluate(() => {
-    const pick = (n) => (n?.textContent || "").trim();
-    const links = Array.from(document.querySelectorAll('a[href*="MarketDetails?id"]'));
-
-    const out = { active: [], trending: [] };
-
-    function isTrending(el) {
-      return /#\s*\d+\s*HOT/.test(el.innerText.toUpperCase());
-    }
-
-    for (const a of links) {
-      const id = new URL(a.href).searchParams.get("id");
-      if (!id) continue;
-
-      const card = a.closest("article,div") || a.parentElement;
-
-      const category = pick(card?.querySelector(".badge,.chip,.category"));
-      const options = [];
-
-      const rows = card?.querySelectorAll(".option,.side,[data-option]");
-      rows && rows.forEach(r => {
-        const lbl = pick(r.querySelector(".label,.team,.option-label"));
-        const pctEl = r.querySelector(".percent,.percentage");
-        const pct = pctEl ? parseInt(pctEl.textContent.replace("%","")) : null;
-        if (lbl && pct != null) options.push({ label: lbl, pct });
-      });
-
-      const entry = { id, url: a.href, title: pick(card?.querySelector("h3,.title")), category, options };
-
-      if (isTrending(card)) out.trending.push(entry)
-      else out.active.push(entry);
-    }
-
-    return out;
-  });
-
-  await page.close();
-  return data;
+// Escape Markdown
+function esc(s) {
+  return s?.replace(/([_*\[\]()~>#+\-=|{}.!])/g, "\\$1");
 }
 
-async function scrapeMarketDetail(url) {
-  const page = await newPage();
-  await page.goto(url, { waitUntil: "networkidle2" });
-  const text = (x) => (x?.textContent || "").trim();
-
-  const d = await page.evaluate(() => {
-    const t = (x) => (x?.textContent || "").trim();
-    const raw = document.body.innerText.toUpperCase();
-
-    let title = document.querySelector("h1,h2,.title")?.textContent?.trim() || "";
-    if (!title) {
-      const og = document.querySelector('meta[property="og:title"]')?.content;
-      if (og) title = og.trim();
-    }
-
-    let status = "open";
-    let winner = null;
-    if (raw.includes("ORACLE CLOSED")) status = "closed";
-    const m = raw.match(/ORACLE RESOLVED:\s*(.+)$/mi);
-    if (m) { status = "resolved"; winner = m[1].trim(); }
-
-    const options = [];
-    const rows = document.querySelectorAll(".option,.side,[data-option]");
-    rows && rows.forEach(r => {
-      const lbl = t(r.querySelector(".label,.team,.option-label,span,strong"));
-      const pctEl = r.querySelector(".percent,.percentage");
-      if (lbl && pctEl) {
-        const pct = parseInt(pctEl.textContent.replace("%",""));
-        if (Number.isFinite(pct)) options.push({label:lbl,pct});
-      }
-    });
-
-    const id = new URL(location.href).searchParams.get("id");
-
-    // close time
-    let closeISO = "";
-    const body = document.body.innerText;
-    const dt = body.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\s+at\s+\d{1,2}:\d{2}/i);
-    if (dt) {
-      const d = new Date(dt[0]);
-      if (!isNaN(d.getTime())) closeISO = d.toISOString();
-    }
-
-    return { id, url: location.href, title, status, winner, options, closeISO };
-  });
-
-  await page.close();
-  return d;
-}
-
-/* ============================= HUMAN TIME ============================= */
-
-function humanizeEta(targetMs) {
-  if (!Number.isFinite(targetMs)) return "";
-  const diff = Math.max(0, Math.floor((targetMs - Date.now())/1000));
-  const min = Math.floor(diff/60), hr = Math.floor(min/60), day = Math.floor(hr/24);
-  if (day>=2) return `in about ${day} days`;
-  if (day===1) return `in about 1 day`;
-  if (hr>=2) return `in about ${hr} hours`;
-  if (hr===1) return `in about 1 hour`;
-  if (min>=2) return `in about ${min} minutes`;
-  if (min===1) return `in about 1 minute`;
-  return "soon";
-}
-
-/* ============================= FORMATTING ============================= */
-
+// ─────────────────────────────────────────────
+// Format Messages
+// ─────────────────────────────────────────────
 function fmtNew(m) {
-  const emoji = detectEmoji(m.title,m.category);
-  const lines = (m.options||[]).slice(0,3).map(o=>`• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`).join("\n");
-  return `🔥 <b>New Market Live</b>
-${emoji} <b>${escapeHtml(m.title)}</b>
-⏳ ${escapeHtml(m.endsIn||"soon")}
-${lines}
-🔗 ${m.url}`;
+  const opts = m.options?.map(o => `• ${esc(o.label)} — ${o.pct}%`).join("\n") || "";
+  const time = m.time || "";
+  return `🔥 *New Market Live on Auracle*\n🏟️ ${esc(m.title)}\n⏳ ${time}\n\n${opts}\n\n🔗 ${m.url}`;
+}
+
+function fmtTrending(m) {
+  return `📈 *Trending Now On Auracle!*\n🏟️ ${esc(m.title)}\n\n🔗 ${m.url}`;
 }
 
 function fmtClosed(m) {
-  const emoji = detectEmoji(m.title,m.category);
-  const list = (m.options||[]).map(o=>`${escapeHtml(o.label)} ${o.pct}%`).join(" - ")||"—";
-  return `🛑 <b>Market Closed — Final Pool</b>
-${emoji} <b>${escapeHtml(m.title)}</b>
-📊 ${list}
-👀 Awaiting resolution…
-🔗 ${m.url}`;
+  const opts = m.options?.map(o => `${esc(o.label)} ${o.pct}%`).join(" | ") || "";
+  return `🛑 *Market Closed — Final Pool*\n🏟️ ${esc(m.title)}\n📊 ${opts || "—"}\n👀 Awaiting resolution…\n🔗 ${m.url}`;
 }
 
 function fmtResolved(m) {
-  const emoji = detectEmoji(m.title,m.category);
-  const list = (m.options||[]).map(o=>`${escapeHtml(o.label)}: <b>${o.pct}%</b>`).join(" | ")||"—";
-  return `✅ <b>Market Resolved</b>
-${emoji} <b>${escapeHtml(m.title)}</b>
-🏆 Winner: <b>${escapeHtml(m.winner)}</b>
-📊 Final: ${list}
-💰 Rewards live on Auracle
-🔗 ${m.url}`;
+  const opts = m.options?.map(o => `${esc(o.label)} ${o.pct}%`).join(" | ") || "";
+  return `✅ *Market Resolved*\n🏟️ ${esc(m.title)}\n🏆 Winner: ${esc(m.winner)}\n📊 Final: ${opts || "—"}\n💰 Rewards now live on Auracle\n🔗 ${m.url}`;
 }
 
-/* ============================= TICK ============================= */
+// ─────────────────────────────────────────────
+// Puppeteer helpers
+// ─────────────────────────────────────────────
+async function browserPage() {
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox","--disable-setuid-sandbox"]
+  });
+  const page = await browser.newPage();
+  await page.setUserAgent("Mozilla/5.0");
+  return { browser, page };
+}
+
+// scrape Active + Trending list
+async function scrapeList() {
+  const { browser, page } = await browserPage();
+  const url = `${AURACLE_BASE}/Markets?ts=${Date.now()}`;
+
+  try {
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+
+    // scroll
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+    });
+    await page.waitForTimeout(2000);
+
+    const sections = await page.evaluate(() => {
+      function grab(selector) {
+        const cards = Array.from(document.querySelectorAll(`${selector} a[href*="id="]`));
+        return cards.map(a => {
+          const id = new URL(a.href).searchParams.get("id");
+          const title = a.innerText?.trim().split("\n")[0] || "";
+          return { id, title, url: a.href };
+        });
+      }
+      return {
+        active: grab("text=Active Auracles, Active Auracle, active-auracles,div:has(> h2:contains('Active'))"),
+        trending: grab("text=Trending, trending-auracles,div:has(> h2:contains('Trending'))")
+      };
+    });
+
+    return sections;
+  } catch (e) {
+    console.log("[list] error", e.message);
+    return { active: [], trending: [] };
+  } finally {
+    await browser.close();
+  }
+}
+
+// scrape MarketDetails page
+async function scrapeDetail(url) {
+  const { browser, page } = await browserPage();
+  try {
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+    await page.waitForTimeout(1500);
+
+    return await page.evaluate(() => {
+      const text = document.body.innerText;
+
+      function readOptions() {
+        const rows = Array.from(document.querySelectorAll(".MarketDetailOption, .market-option"));
+        return rows.map(r => {
+          const t = r.innerText;
+          const m = t.match(/(.*) (\d+)%/);
+          if (m) return { label: m[1].trim(), pct: m[2] };
+          return null;
+        }).filter(Boolean);
+      }
+
+      const title = document.querySelector("h1,h2,.market-title")?.innerText.trim() || "";
+      const options = readOptions();
+
+      let status = "open";
+      let winner = null;
+      if (/ORACLE CLOSED/i.test(text)) status = "closed";
+      if (/ORACLE RESOLVED/i.test(text)) {
+        status = "resolved";
+        const mm = text.match(/ORACLE RESOLVED:\s*(.*)/i);
+        winner = mm?.[1]?.trim();
+      }
+
+      // map YES/NO
+      if (winner && options.length === 2) {
+        const l = winner.toLowerCase();
+        if (l.includes("yes")) winner = options[0].label;
+        if (l.includes("no")) winner = options[1].label;
+      }
+
+      const d = document.querySelector("div:contains('Ends')")?.innerText || "";
+      return { title, status, winner, options, endRaw: d };
+    });
+  } catch {
+    return null;
+  } finally {
+    await browser.close();
+  }
+}
+
+// ─────────────────────────────────────────────
+// Time formatting
+// ─────────────────────────────────────────────
+function cleanTime(raw) {
+  if (!raw) return "";
+  const m = raw.match(/Ends.*?in (.*)/i);
+  return m ? `in ${m[1]}` : "";
+}
+
+// ─────────────────────────────────────────────
+// Scheduler tick
+// ─────────────────────────────────────────────
+let TICK_RUNNING = false;
 
 async function tick() {
-  const start = Date.now();
+  if (TICK_RUNNING) return;
+  TICK_RUNNING = true;
+
   console.log("[tick] START", new Date().toISOString());
 
-  const { active, trending } = await fetchMarketsList();
-  console.log(`[tick] list → active ${active.length}, trending ${trending.length}`);
+  const lists = await scrapeList();
+  let { active, trending } = lists;
 
-  const ids = new Set([...active, ...trending].map(m=>m.id));
-  const state = loadState();
-  const known = new Set(Object.keys(state.markets));
-  const all = new Set([...ids, ...known]);
-
-  /* first boot seed */
-  if (!state.seeded && all.size) {
-    console.log("[seed] seeding first scrape", all.size);
-    for (const m of [...active, ...trending]) {
-      state.markets[m.id] = {
-        announcedOpen: true,
-        announcedClosed: m.status==="closed",
-        announcedResolved: m.status==="resolved",
-        lastStatus: "open",
-        url: m.url,
-        retired: m.status==="resolved",
-        lastSeen: { title:m.title, category:m.category, options:m.options }
-      };
-    }
-    state.seeded = true;
-    saveState(state);
-    console.log("[seed] done — no announcements");
+  // protect against glitch ticks (site returns 0 temporarily)
+  if (active.length === 0 && trending.length === 0) {
+    console.log("[tick] zero lists — skipping");
+    TICK_RUNNING = false;
     return;
   }
 
-  /* detail scrape each watched */
-  for (const id of all) {
-    const rec = state.markets[id] || {};
+  console.log(`[tick] list → active ${active.length}, trending ${trending.length}`);
+
+  const ids = new Set([...active, ...trending].map(m => m.id));
+
+  // Seed existing markets silently on first startup
+  for (const id of ids) {
+    if (!state.markets[id]) {
+      state.markets[id] = { id, announcedOpen: true };
+    }
+  }
+
+  // detect NEW markets (from active only)
+  for (const m of active) {
+    if (!state.markets[m.id]?.announcedOpen) {
+      const detail = await scrapeDetail(m.url);
+      if (detail) {
+        const time = cleanTime(detail.endRaw);
+        await send(fmtNew({ ...m, options: detail.options, time }));
+      }
+      state.markets[m.id] = { ...state.markets[m.id], announcedOpen: true, url: m.url };
+      saveState();
+    }
+  }
+
+  // detect TRENDING entries
+  for (const m of trending) {
+    const rec = state.markets[m.id] || {};
+    if (!rec.announcedTrending) {
+      await send(fmtTrending({ ...m, url: m.url }));
+      state.markets[m.id] = { ...rec, announcedTrending: true, url: m.url };
+      saveState();
+    }
+  }
+
+  // detail checks for closed/resolved
+  for (const id of Object.keys(state.markets)) {
+    const rec = state.markets[id];
     if (rec.retired) continue;
 
-    const card = active.find(x=>x.id===id) || trending.find(x=>x.id===id);
-    const url = rec.url || card?.url || `${AURACLE_BASE_URL}/MarketDetails?id=${id}`;
+    const url = rec.url || `${AURACLE_BASE}/MarketDetails?id=${id}`;
+    const detail = await scrapeDetail(url);
+    if (!detail) continue;
 
-    const detail = await scrapeMarketDetail(url);
-
-    // track lastSeen
-    if (!state.markets[id]) state.markets[id] = {};
-    const m = state.markets[id];
-
-    if (detail.status === "open") {
-      if (detail.closeISO) {
-        const ms = Date.parse(detail.closeISO);
-        if (!isNaN(ms)) detail.endsIn = humanizeEta(ms);
-      }
-      m.lastSeen = {
-        title: detail.title,
-        category: detail.category,
-        endsIn: detail.endsIn,
-        options: detail.options
-      };
+    // closed
+    if (detail.status === "closed" && !rec.announcedClosed) {
+      await send(fmtClosed({ ...detail, url }));
+      state.markets[id].announcedClosed = true;
+      state.markets[id].options = detail.options;
+      saveState();
     }
 
-    /* OPEN announcement */
-    if (detail.status==="open" && !m.announcedOpen) {
-      const opts = detail.options?.length ? detail.options : m.lastSeen?.options;
-      await send(fmtNew({...detail,options:opts}));
-      m.announcedOpen = true;
+    // resolved
+    if (detail.status === "resolved" && !rec.announcedResolved) {
+      await send(fmtResolved({ ...detail, url, options: rec.options }));
+      state.markets[id].announcedResolved = true;
+      state.markets[id].retired = true;
+      saveState();
     }
-
-    /* CLOSED announcement */
-    if (detail.status==="closed" && !m.announcedClosed) {
-      const opts = detail.options?.length
-        || m.lastSeen?.options?.length
-        ? (detail.options || m.lastSeen.options)
-        : [];
-      m.closedSnapshot = { options: opts };
-      await send(fmtClosed({...detail,options:opts}));
-      m.announcedClosed = true;
-    }
-
-    /* RESOLVED announcement */
-    if (detail.status==="resolved" && !m.announcedResolved) {
-      const finalOpts = m.closedSnapshot?.options?.length
-        ? m.closedSnapshot.options
-        : (m.lastSeen?.options || detail.options || []);
-
-      let win = detail.winner;
-      const lower = (win||"").toLowerCase();
-      if (lower.includes("yes") && finalOpts[0]?.label) win = finalOpts[0].label;
-      if (lower.includes("no")  && finalOpts[1]?.label) win = finalOpts[1].label;
-
-      await send(fmtResolved({...detail, winner:win, options:finalOpts}));
-      m.announcedResolved = true;
-      m.retired = true;
-    }
-
-    m.lastStatus = detail.status;
-    m.url = url;
   }
 
-  saveState(state);
-  console.log("[tick] END", new Date().toISOString(), "elapsed", Date.now()-start, "ms");
+  TICK_RUNNING = false;
 }
 
-/* ============================= COMMANDS ============================= */
+// ─────────────────────────────────────────────
+// Heartbeat server (Railway keeps alive)
+http.createServer((_,res)=>res.end("OK")).listen(8080,()=>console.log("[HTTP] :8080"));
 
-bot.command("ping", ctx=>ctx.reply("pong ✅"));
-bot.command("tick_now", async ctx=>{
-  await ctx.reply("manual tick running…");
-  await tick();
-  await ctx.reply("done ✅");
-});
-bot.command("whereami", ctx=>ctx.reply(`Target: ${getTargetChatId()}\nHere: ${ctx.chat.id}\n/set_target here`));
-bot.command("set_target", ctx=>{
-  const [,arg] = ctx.message.text.split(" ");
-  if (!arg) return ctx.reply("Usage: /set_target <chatId|here>");
-  const id = arg==="here" ? ctx.chat.id : arg;
-  setTargetChatId(id);
-  ctx.reply(`✅ Target set: ${id}`);
-});
-
-/* ============================= LOOP ============================= */
-
-const intervalSec = Math.max(8, parseInt(POLL_INTERVAL_SECONDS||"30",10));
-
-async function safeTickOnce() {
-  try {
-    await tick();
-  } catch(e) {
-    console.error("[loop] tick error", e?.stack||e);
-  }
-}
-
-safeTickOnce();
-setInterval(safeTickOnce, intervalSec*1000);
-
-setInterval(()=>console.log("[hb]", new Date().toISOString()), 10000);
-
-/* ============================= SERVER + LAUNCH ============================= */
-const server = http.createServer((_,res)=>{
-  res.writeHead(200,{"Content-Type":"application/json"});
-  res.end(JSON.stringify({ ok:true, ts:new Date().toISOString() }));
-});
-server.listen(PORT,()=>console.log(`[HTTP] :${PORT}`));
-bot.launch();
+// ─────────────────────────────────────────────
+// Start loop
 console.log("✅ Bot running");
+await tick();
+setInterval(tick, POLL_INTERVAL_MS);
+setInterval(() => console.log("[hb]", new Date().toISOString()), 10000);

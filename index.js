@@ -78,6 +78,7 @@ function setTargetChatId(id) {
 
 // ---------- Utils ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 function escapeHtml(s = '') {
   return String(s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -85,7 +86,7 @@ function escapeHtml(s = '') {
     .replace(/'/g, '&#39;');
 }
 
-// ✅ WINNER + OPTION CLEANUP USED EVERYWHERE
+// Winner/option cleanup
 function cleanLabel(label = "") {
   if (!label) return "";
   let s = label.trim();
@@ -94,7 +95,6 @@ function cleanLabel(label = "") {
   if (s.length > 40) s = s.slice(0, 40);
   return s;
 }
-
 function uniqueOptions(options = []) {
   const out = [];
   const seen = new Set();
@@ -110,26 +110,25 @@ function uniqueOptions(options = []) {
   }
   return out;
 }
-
 function mapWinnerToLabel(winnerRaw, options = []) {
   if (!winnerRaw) return null;
   const r = winnerRaw.trim().toUpperCase();
 
-  // direct literal match
+  // direct contains match against known option labels
   for (const o of options) {
     if (o.label && r.includes(o.label.toUpperCase())) return o.label;
   }
 
-  // YES / NO / DRAW mapping
-  if (r.startsWith("YES")) return options[0]?.label ?? "YES";
-  if (r.startsWith("NO"))  return options[1]?.label ?? "NO";
+  // YES / NO / DRAW mapping by position
+  if (r.startsWith("YES"))  return options[0]?.label ?? "YES";
+  if (r.startsWith("NO"))   return options[1]?.label ?? "NO";
   if (r.startsWith("DRAW")) return options[2]?.label ?? "DRAW";
 
   if (r.includes("INVALID")) return "Invalid";
   return winnerRaw.trim();
 }
 
-// Human time text
+// Turn future ISO -> "in about X"
 function humanizeEta(targetMs, nowMs = Date.now()) {
   if (!Number.isFinite(targetMs)) return '';
   let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
@@ -303,7 +302,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             if (options.length >= 3) break;
           }
 
-          // Simple in-page dedupe (page context; mirror of uniqueOptions)
+          // simple de-dupe
           const oOut = [];
           const seen = new Set();
           for (const o of options) {
@@ -340,7 +339,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           else activeArr.push(entry);
         }
 
-        // If site only exposes one section shape, treat it as Active
+        // If only one shape shows up, treat as Active
         if (activeArr.length === 0 && trendingArr.length > 0) {
           return { trending: [], active: trendingArr };
         }
@@ -481,14 +480,12 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     })();
 
-    // Deduplicate & constrain
-    // (We don't have access to top-level uniqueOptions here; mimic minimal dedupe.)
+    // De-dup & limit
     const byLabel = new Map();
     for (const o of options) {
       const L = (o.label || '').trim();
       if (!L) continue;
       const U = L.toUpperCase();
-      // ignore obvious noise lines
       if (/(PROBABILITY|CHART|POOL|SPORTS|WINS|IMPLIED)/i.test(U)) continue;
       if (!byLabel.has(U)) byLabel.set(U, { label: L, pct: o.pct ?? null });
       else if (o.pct != null) byLabel.get(U).pct = o.pct;
@@ -593,15 +590,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 }
 
 // ---------- Message Formatting ----------
-
-// escape HTML for Telegram
-function escapeHtml(s = '') {
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
 function formatOptionsList(options = []) {
   if (!options?.length) return '—';
   return options
@@ -684,25 +672,6 @@ async function send(msg, tag = '') {
 }
 
 // ---------- MARKET TICK ENGINE ----------
-
-// convert date to "in about X days"
-function humanizeEta(targetMs, nowMs = Date.now()) {
-  if (!Number.isFinite(targetMs)) return '';
-  let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
-
-  const min = Math.floor(diff / 60);
-  const hr = Math.floor(min / 60);
-  const day = Math.floor(hr / 24);
-
-  if (day >= 2) return `in about ${day} days`;
-  if (day === 1) return `in about 1 day`;
-  if (hr >= 2) return `in about ${hr} hours`;
-  if (hr === 1) return `in about 1 hour`;
-  if (min >= 2) return `in about ${min} minutes`;
-  if (min === 1) return `in about 1 minute`;
-  return `in moments`;
-}
-
 async function tick() {
   console.log(`[tick] run @ ${new Date().toISOString()}`);
 
@@ -736,6 +705,7 @@ async function tick() {
       lastStatus: 'unknown',
       lastSeen: null,
       closedSnapshot: null,
+      wasTrending: false,
       retired: false
     };
 
@@ -748,13 +718,10 @@ async function tick() {
     const detail = await scrapeMarketDetail(url, { debug: dbg });
     if (!detail?.id) continue;
 
-    // use list info when available
     const card = activeById.get(id) || trendingById.get(id);
-
-    // build next state
     const next = { ...prev, url: detail.url };
 
-    // update last seen for open markets
+    // OPEN: update lastSeen
     if (detail.status === 'open') {
       let endsIn = '';
       if (detail.closeISO) {
@@ -764,10 +731,10 @@ async function tick() {
       if (!endsIn && card?.endsIn) endsIn = card.endsIn;
 
       const opts = card?.options?.length
-        ? card.options
+        ? uniqueOptions(card.options)
         : detail?.options?.length
-        ? detail.options
-        : prev.lastSeen?.options || [];
+        ? uniqueOptions(detail.options)
+        : uniqueOptions(prev.lastSeen?.options || []);
 
       next.lastSeen = {
         title: detail.title,
@@ -777,22 +744,19 @@ async function tick() {
       };
     }
 
-    // capture final pool when entering closed
+    // CLOSED: capture final pool once
     if (detail.status === 'closed' && !prev.announcedClosed && !next.closedSnapshot) {
       const opts = prev.lastSeen?.options?.length
         ? prev.lastSeen.options
         : detail.options || [];
-      next.closedSnapshot = { options: opts };
+      next.closedSnapshot = { options: uniqueOptions(opts) };
     }
 
     // ---- ANNOUNCE NEW MARKET ----
     if (detail.status === 'open' && activeById.has(id) && !prev.announcedOpen) {
-      const opts = card?.options?.length
-        ? card.options
-        : prev.lastSeen?.options?.length
-        ? prev.lastSeen.options
-        : detail.options;
-
+      const opts = next.lastSeen?.options?.length
+        ? next.lastSeen.options
+        : uniqueOptions(detail.options || []);
       await send(
         fmtNewMarket({
           ...detail,
@@ -802,7 +766,6 @@ async function tick() {
         }),
         'OPEN'
       );
-
       next.announcedOpen = true;
     }
 
@@ -811,7 +774,7 @@ async function tick() {
       const opts =
         next.closedSnapshot?.options?.length
           ? next.closedSnapshot.options
-          : prev.lastSeen?.options || detail.options;
+          : uniqueOptions(prev.lastSeen?.options || detail.options || []);
 
       await send(
         fmtClosed({
@@ -827,32 +790,36 @@ async function tick() {
 
     // ---- ANNOUNCE RESOLVED ----
     if (detail.status === 'resolved' && !prev.announcedResolved) {
-      const opts =
+      // Build the best options set (final pool) first
+      const finalOptions =
         next.closedSnapshot?.options?.length
           ? next.closedSnapshot.options
-          : prev.lastSeen?.options || detail.options;
+          : uniqueOptions(prev.lastSeen?.options || detail.options || []);
+
+      // Map "YES/NO/DRAW" to team name where possible
+      const mappedWinner = mapWinnerToLabel(detail.winner, finalOptions);
 
       await send(
         fmtResolved({
           ...detail,
-          options: opts,
+          winner: mappedWinner,
+          options: finalOptions,
           title: next.lastSeen?.title || detail.title
         }),
         'RESOLVED'
       );
 
       next.announcedResolved = true;
-      next.retired = true;
+      next.retired = true; // stop tracking
     }
 
     // ---- ANNOUNCE TRENDING ENTRY ----
     const trendingNow = trendingIds.has(id);
     if (trendingNow && !prev.wasTrending) {
       const opts =
-        card?.options?.length
-          ? card.options
-          : prev.lastSeen?.options || detail.options;
-
+        next.lastSeen?.options?.length
+          ? next.lastSeen.options
+          : uniqueOptions(detail.options || []);
       await send(
         fmtTrending({
           ...detail,
@@ -868,6 +835,178 @@ async function tick() {
     state.markets[id] = next;
   }
 
+  // Optional compacting of retired
+  const MAX_RETIRED = 2000;
+  const ids = Object.keys(state.markets);
+  if (ids.length > MAX_RETIRED) {
+    for (const id of ids) {
+      if (state.markets[id]?.retired) delete state.markets[id];
+    }
+  }
+
   saveState(state);
   console.log('[tick] done ✅');
 }
+
+// ---------- Commands ----------
+bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
+
+bot.command('health', async (ctx) => {
+  try {
+    const { trending, active } = await fetchMarketsFromSections({ debug: true });
+
+    const aSample = await Promise.all(
+      active.slice(0,2).map(async (c) => {
+        const d = await scrapeMarketDetail(c.url, { debug: false });
+        return (d?.title || '(no title)').toUpperCase();
+      })
+    );
+    const tSample = await Promise.all(
+      trending.slice(0,2).map(async (c) => {
+        const d = await scrapeMarketDetail(c.url, { debug: false });
+        return (d?.title || '(no title)').toUpperCase();
+      })
+    );
+
+    await ctx.reply(
+      `Active: ${active.length}  |  Trending: ${trending.length}\n` +
+      `Active sample: ${aSample.join(' | ') || '—'}\n` +
+      `Trending sample: ${tSample.join(' | ') || '—'}`
+    );
+  } catch (e) {
+    await ctx.reply(`Fetch failed: ${String(e.message || e).slice(0, 300)}`);
+  }
+});
+
+bot.command('whereami', async (ctx) => {
+  const target = getTargetChatId();
+  const here = ctx.chat?.id;
+  await ctx.reply(`Target chat: ${String(target)}\nThis chat: ${String(here)}\nTip: /set_target here`);
+});
+
+bot.command('set_target', async (ctx) => {
+  const parts = (ctx.message.text || '').trim().split(/\s+/);
+  const arg = parts[1];
+  if (!arg) { await ctx.reply('Usage: /set_target <chatId|here>'); return; }
+  const id = (arg === 'here') ? ctx.chat.id : arg;
+  setTargetChatId(id);
+  await ctx.reply(`OK. Target chat set to: ${id}`);
+});
+
+bot.command('announce_open_now', async (ctx) => {
+  const parts = (ctx.message.text || '').trim().split(/\s+/);
+  const limit = Math.max(1, Math.min(parseInt(parts[1] || '3', 10) || 3, 20));
+
+  const { active } = await fetchMarketsFromSections({ debug: false });
+  let count = 0;
+  for (const card of active.slice(0, limit)) {
+    const detail = await scrapeMarketDetail(card.url, { debug: dbg });
+    const merged = {
+      ...card,
+      id: card.id || detail?.id,
+      url: detail?.url || card.url,
+      title: (detail?.title || 'Unknown').toUpperCase(),
+      options: (card.options?.length ? uniqueOptions(card.options) : uniqueOptions(detail?.options || []))
+    };
+    await send(fmtNewMarket(merged), 'OPEN(TEST)');
+    const st = loadState();
+    st.markets[merged.id] = {
+      ...(st.markets[merged.id] || {}),
+      announcedOpen: true,
+      lastStatus: 'open',
+      url: merged.url,
+      missingCount: 0,
+      wasTrending: false,
+      lastSeen: { title: merged.title, category: merged.category, endsIn: merged.endsIn, options: merged.options }
+    };
+    saveState(st);
+    count++;
+  }
+  await ctx.reply(`Announced ${count} open market(s) to target chat.`);
+});
+
+bot.command('tick_now', async (ctx) => {
+  try {
+    await ctx.reply('Tick started…');
+    await tick();
+    await ctx.reply('Tick finished.');
+  } catch (e) {
+    await ctx.reply(`Tick error: ${e.message || e}`);
+  }
+});
+
+bot.command('state', async (ctx) => {
+  try {
+    const s = summarizeState(loadState());
+    await ctx.reply(
+      `seeded: ${s.seeded}\n` +
+      `target: ${s.targetChatId}\n` +
+      `tracked: ${s.total}\n` +
+      `statuses: open=${s.open}, closed=${s.closed}, resolved=${s.resolved}, retired=${s.retired}\n` +
+      `announced: open=${s.aO}, closed=${s.aC}, resolved=${s.aR}`
+    );
+  } catch { await ctx.reply('state read error'); }
+});
+
+bot.command('reseed_off', async (ctx) => {
+  const st = loadState(); st.seeded = true; saveState(st);
+  await ctx.reply('Seeding disabled (seeded=true).');
+});
+
+// ---------- Boot: bot + robust scheduler ----------
+(async () => {
+  try {
+    await bot.launch();
+    console.log('[bot] started (polling).');
+    await bot.telegram.setMyCommands([
+      { command: 'ping', description: 'Ping the bot' },
+      { command: 'health', description: 'Active/Trending counts (titles from details)' },
+      { command: 'whereami', description: 'Show current & target chat' },
+      { command: 'set_target', description: 'Set target chat id or "here"' },
+      { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
+      { command: 'tick_now', description: 'Run a tick immediately' },
+      { command: 'state', description: 'Show tracked/announced counts' },
+    ]);
+  } catch (e) {
+    console.error('[bot] launch error:', e?.message || e);
+  }
+})();
+
+// Heartbeat every 10s
+setInterval(() => {
+  console.log(`[hb] alive @ ${new Date().toISOString()} uptime=${process.uptime().toFixed(1)}s`);
+}, 10_000);
+
+// Self-rescheduling loop (no cron)
+const intervalSec = Math.max(5, parseInt(POLL_INTERVAL_SECONDS || '30', 10));
+console.log(`[loop] arming self-scheduler every ${intervalSec}s (TZ=${TZ})`);
+async function loopTick() {
+  console.log(`[loop] fire @ ${new Date().toISOString()}`);
+  try {
+    await tick();
+  } catch (e) {
+    console.error('[loop] tick error:', e?.message || e);
+  } finally {
+    setTimeout(loopTick, intervalSec * 1000);
+  }
+}
+loopTick(); // kick off
+
+// ---------- HTTP server ----------
+const server = http.createServer(async (req, res) => {
+  if (req.url === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const st = loadState();
+    res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), ...summarizeState(st) }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Auracle Telegram bot is running.\n');
+});
+server.listen(PORT, () => console.log(`[http] listening on :${PORT}`));
+
+// ---------- Shutdown + error traps ----------
+process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
+process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });
+process.once('SIGTERM', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGTERM'); server.close(); });

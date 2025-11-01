@@ -639,6 +639,12 @@ async function tick() {
     // include trending so we never miss closings
     const toWatch = new Set([...activeIds, ...trendingIds, ...knownIds]);
 
+    // ⛔ skip markets we already announced as resolved
+    for (const id of [...toWatch]) {
+    const rec = state.markets[id];
+    if (rec?.retired) toWatch.delete(id);
+    }
+
     console.log('[tick] counts → active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
 
     const activeById   = new Map(active.map(m => [m.id, m]));
@@ -767,10 +773,13 @@ async function tick() {
         const finalOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
             : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);
+
         const resolvedPayload = { ...m, options: finalOptions, title: m.title || prev.lastSeen?.title || 'Unknown' };
         await send(fmtResolved(resolvedPayload), 'RESOLVED');
+
         next.announcedResolved = true;
-      }
+        next.retired = true;     // ✅ stop tracking this market forever
+        }
 
       // Trending enter
       const isTrendingNow = trendingIds.has(m.id);
@@ -793,6 +802,15 @@ async function tick() {
       state.markets[m.id] = next;
     }
 
+    // 🧹 optional cleanup of retired markets
+    const MAX_RETIRED = 1000;
+    const ids = Object.keys(state.markets);
+    if (ids.length > MAX_RETIRED) {
+      for (const id of ids) {
+        if (state.markets[id]?.retired) delete state.markets[id];
+  }
+}
+    
     saveState(state);
     console.log('[tick] done', summarizeState(state));
   } catch (e) {

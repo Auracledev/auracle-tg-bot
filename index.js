@@ -47,7 +47,7 @@ const saveState = (s) => fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)
 
 function summarizeState(state) {
   const m = state.markets || {};
-  let total=0, open=0, closed=0, resolved=0, aO=0, aC=0, aR=0;
+  let total=0, open=0, closed=0, resolved=0, aO=0, aC=0, aR=0, retired=0;
   for (const id in m) {
     total++;
     const s = m[id];
@@ -57,9 +57,10 @@ function summarizeState(state) {
     if (s.announcedOpen) aO++;
     if (s.announcedClosed) aC++;
     if (s.announcedResolved) aR++;
+    if (s.retired) retired++;
   }
   return {
-    total, open, closed, resolved, aO, aC, aR,
+    total, open, closed, resolved, retired, aO, aC, aR,
     seeded: !!state.seeded,
     targetChatId: state.targetChatId || TELEGRAM_CHAT_ID
   };
@@ -87,7 +88,7 @@ function escapeHtml(s = '') {
 // Turn a future time (ms) into "in about 29 days", etc.
 function humanizeEta(targetMs, nowMs = Date.now()) {
   if (!Number.isFinite(targetMs)) return '';
-  let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000)); // seconds
+  let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
   const min = Math.floor(diff / 60);
   const hr  = Math.floor(min / 60);
   const day = Math.floor(hr / 24);
@@ -192,10 +193,9 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
           // Category
-          const category =
-            text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
+          const category = text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
 
-          // Robust endsIn: collect candidates inside the card and pick the LARGEST window
+          // endsIn: choose largest window found in-card
           const MINUTES = (n, unit) => {
             unit = (unit || '').toLowerCase();
             if (unit.startsWith('day'))   return n * 24 * 60;
@@ -450,7 +450,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     })();
 
-    // Normalize and backfill missing percentages for 2-way markets
+    // Normalize and backfill for 2-way markets
     options = options.map((o, i) => ({
       label: (o.label || (i === 2 ? 'Draw' : `Option ${i+1}`)).trim(),
       pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
@@ -638,11 +638,10 @@ async function tick() {
 
     // include trending so we never miss closings
     const toWatch = new Set([...activeIds, ...trendingIds, ...knownIds]);
-
     // ⛔ skip markets we already announced as resolved
     for (const id of [...toWatch]) {
-    const rec = state.markets[id];
-    if (rec?.retired) toWatch.delete(id);
+      const rec = state.markets[id];
+      if (rec?.retired) toWatch.delete(id);
     }
 
     console.log('[tick] counts → active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
@@ -701,12 +700,14 @@ async function tick() {
           url:               m.url,
           missingCount:      0,
           wasTrending:       trendingIds.has(m.id),
+          retired:           m.status === 'resolved', // if already resolved on first seed, retire
           lastSeen:          card ? { title: m.title, category: card.category, endsIn: m.endsIn || card.endsIn, options: card.options } :
                                     { title: m.title, category: m.category, endsIn: m.endsIn, options: m.options },
           closedSnapshot:    m.status === 'closed' ? { options: (m.options || []) } : null
         };
       }
       state.seeded = true;
+      // optional GC on seed
       saveState(state);
       console.log('[seed] done');
       return;
@@ -724,9 +725,15 @@ async function tick() {
     for (const m of results) {
       const prev = state.markets[m.id] || {
         announcedOpen: false, announcedClosed: false, announcedResolved: false,
-        lastStatus: 'unknown', url: m.url, missingCount: 0, lastSeen: null, closedSnapshot: null, wasTrending: false
+        lastStatus: 'unknown', url: m.url, missingCount: 0, lastSeen: null, closedSnapshot: null, wasTrending: false, retired: false
       };
       const next = { ...prev, url: m.url };
+
+      if (prev.retired) {
+        // Already retired — skip updates
+        state.markets[m.id] = next;
+        continue;
+      }
 
       if (m.status === 'open') {
         const card = activeById.get(m.id) || trendingById.get(m.id);
@@ -773,13 +780,12 @@ async function tick() {
         const finalOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
             : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);
-
         const resolvedPayload = { ...m, options: finalOptions, title: m.title || prev.lastSeen?.title || 'Unknown' };
         await send(fmtResolved(resolvedPayload), 'RESOLVED');
 
         next.announcedResolved = true;
         next.retired = true;     // ✅ stop tracking this market forever
-        }
+      }
 
       // Trending enter
       const isTrendingNow = trendingIds.has(m.id);
@@ -802,15 +808,15 @@ async function tick() {
       state.markets[m.id] = next;
     }
 
-    // 🧹 optional cleanup of retired markets
-    const MAX_RETIRED = 1000;
+    // 🧹 optional cleanup of retired markets (keeps state file bounded)
+    const MAX_RETIRED = 2000;
     const ids = Object.keys(state.markets);
     if (ids.length > MAX_RETIRED) {
       for (const id of ids) {
         if (state.markets[id]?.retired) delete state.markets[id];
-  }
-}
-    
+      }
+    }
+
     saveState(state);
     console.log('[tick] done', summarizeState(state));
   } catch (e) {
@@ -912,7 +918,7 @@ bot.command('state', async (ctx) => {
       `seeded: ${s.seeded}\n` +
       `target: ${s.targetChatId}\n` +
       `tracked: ${s.total}\n` +
-      `statuses: open=${s.open}, closed=${s.closed}, resolved=${s.resolved}\n` +
+      `statuses: open=${s.open}, closed=${s.closed}, resolved=${s.resolved}, retired=${s.retired}\n` +
       `announced: open=${s.aO}, closed=${s.aC}, resolved=${s.aR}`
     );
   } catch { await ctx.reply('state read error'); }

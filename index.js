@@ -356,13 +356,112 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       bestTitle = parts[0] || dt;
     }
 
+    // ---------- OPTIONS / PERCENTAGES ----------
     const getPctFromNode = (node) => {
       if (!node) return null;
-      const s = (node?.textContent || '').replace('%','').replace(/[^\d.]/g,'');
+      const s = (node.textContent || '').replace('%','').replace(/[^\d.]/g,'');
       const n = parseFloat(s);
       return Number.isFinite(n) ? Math.round(n) : null;
     };
 
+    let options = [];
+
+    // 1) Primary: rows in “Place Bet” / option rows
+    (function primaryOptionRows() {
+      if (options.length >= 2) return;
+      const rowSelectors = [
+        '.option', '.side',
+        '.option-a, .option-b, .option-c',
+        '.side-a, .side-b, .side-c',
+        '.left, .right, .center',
+        '[data-option]', '[role="listitem"]',
+        '[data-testid="market-option"]',
+        '.market-option, .market-side'
+      ];
+      const labelSelectors = [
+        '.label', '.name', '.team', '.option-label',
+        '[data-testid="option-label"]', '[data-testid="option-name"]',
+        'strong', 'span', 'p'
+      ].join(',');
+      const percentSelectors = [
+        '.percent', '.percentage', '.progress-label', '.option-percent',
+        '[data-testid="option-percent"]'
+      ].join(',');
+
+      for (const sel of rowSelectors) {
+        const rows = Array.from(document.querySelectorAll(sel));
+        if (rows.length >= 2) {
+          const out = rows.map((row, i) => {
+            const labelNode = row.querySelector(labelSelectors);
+            const pctNode   = row.querySelector(percentSelectors);
+            const label = (labelNode?.textContent || '').trim() || `Option ${i+1}`;
+            const pct   = getPctFromNode(pctNode);
+            return { label, pct: Number.isFinite(pct) ? pct : null };
+          }).filter(o => o.label || o.pct !== null);
+          if (out.filter(o => o.label).length >= 2) {
+            options = out.slice(0, 3);
+            break;
+          }
+        }
+      }
+    })();
+
+    // 2) Fallback A: “CURRENT … 33%” blocks under the chart when closed
+    (function chartCurrentBlocks() {
+      if (options.length >= 2 && options.every(o => o.pct !== null)) return;
+      const blocks = Array.from(document.querySelectorAll('*')).filter(el => {
+        const t = (el.textContent || '').toUpperCase();
+        return /CURRENT\s+[A-Z0-9@ ./-]+\s+\d+\s*%/.test(t);
+      });
+      const found = [];
+      for (const el of blocks) {
+        const t = (el.textContent || '').toUpperCase().replace(/\s+/g, ' ').trim();
+        const m = t.match(/CURRENT\s+([A-Z0-9@ ./-]+?)\s+(\d+)\s*%/);
+        if (!m) continue;
+        const label = m[1].trim();
+        const pct = parseInt(m[2], 10);
+        if (label && Number.isFinite(pct)) found.push({ label, pct });
+      }
+      if (found.length >= 2) {
+        options = found.slice(0, 3);
+      }
+    })();
+
+    // 3) Fallback B: “XYZ IMPLIED 33%” panels near the title
+    (function impliedPanels() {
+      if (options.length >= 2 && options.every(o => o.pct !== null)) return;
+      const candidates = Array.from(document.querySelectorAll('*')).filter(el => {
+        const t = (el.textContent || '');
+        return /\bIMPLIED\b/i.test(t) && /%/.test(t) && (t.length <= 120);
+      });
+      const map = new Map(); // label -> pct
+      for (const el of candidates) {
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        // Examples: "PSG IMPLIED 33%", "DRAW IMPLIED 56%", "NICE IMPLIED 11%"
+        const m = t.match(/^(.+?)\s+IMPLIED.*?(\d+)\s*%/i);
+        if (!m) continue;
+        const label = m[1].trim();
+        const pct   = parseInt(m[2], 10);
+        if (label && Number.isFinite(pct)) map.set(label.toUpperCase(), pct);
+      }
+      if (map.size >= 2) {
+        const out = Array.from(map.entries()).map(([label, pct]) => ({ label, pct }));
+        options = out.slice(0, 3);
+      }
+    })();
+
+    // Normalize and backfill missing percentages for 2-way markets
+    options = options.map((o, i) => ({
+      label: (o.label || (i === 2 ? 'Draw' : `Option ${i+1}`)).trim(),
+      pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
+    }));
+    if (options.length === 2) {
+      const [a, b] = options;
+      if (a.pct != null && b.pct == null) b.pct = 100 - a.pct;
+      if (b.pct != null && a.pct == null) a.pct = 100 - b.pct;
+    }
+
+    // Status / resolution
     const pageTextRaw = document.body?.innerText || '';
     const pageTextUP  = up(pageTextRaw);
     const isClosedText = pageTextUP.includes('ORACLE CLOSED - AWAITING RESOLUTION');
@@ -370,49 +469,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     let winner = null;
     const resolvedMatch = pageTextRaw.match(/ORACLE RESOLVED:\s*(.+)$/mi);
     if (resolvedMatch && resolvedMatch[1]) winner = resolvedMatch[1].trim();
-
-    const optionRowSelectors = [
-      '.option', '.side',
-      '.option-a, .option-b, .option-c',
-      '.side-a, .side-b, .side-c',
-      '.left, .right, .center',
-      '[data-option]', '[role="listitem"]',
-      '[data-testid="market-option"]',
-      '.market-option, .market-side'
-    ];
-
-    const labelSelectors = [
-      '.label', '.name', '.team', '.option-label',
-      '[data-testid="option-label"]', '[data-testid="option-name"]',
-      'strong', 'span', 'p'
-    ].join(',');
-
-    const percentSelectors = [
-      '.percent', '.percentage', '.progress-label', '.option-percent',
-      '[data-testid="option-percent"]'
-    ].join(',');
-
-    let options = [];
-    for (const sel of optionRowSelectors) {
-      const rows = Array.from(document.querySelectorAll(sel));
-      if (rows.length >= 2) {
-        options = rows.map((row, i) => {
-          const label = (row.querySelector(labelSelectors)?.textContent || '').trim() || `Option ${i+1}`;
-          const pct = getPctFromNode(row.querySelector(percentSelectors));
-          return { label, pct: Number.isFinite(pct) ? Math.round(pct) : null };
-        }).filter(o => o.label || o.pct !== null);
-        if (options.length >= 2) break;
-      }
-    }
-    if (options.length === 2) {
-      const [a, b] = options;
-      if (a.pct != null && b.pct == null) b.pct = 100 - a.pct;
-      if (b.pct != null && a.pct == null) a.pct = 100 - b.pct;
-    }
-    options = options.map((o, i) => ({
-      label: (o.label || (i === 2 ? 'Draw' : `Option ${i+1}`)).trim(),
-      pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
-    }));
 
     let status = 'open';
     if (winner) status = 'resolved';
@@ -515,10 +571,15 @@ function fmtNewMarket(m) {
   ].join('\n');
 }
 function fmtClosed(m) {
+  const list = (m.options || [])
+    .filter(o => o && o.label)
+    .map(o => `${escapeHtml(o.label)} ${o.pct ?? '?'}%`)
+    .join(' - ') || '—';
+
   return [
     '🛑 <b>Market Closed — Final Pool</b>',
     `🏟️ <b>${escapeHtml(m.title)}</b>`,
-    `📊 ${formatOptionsList(m.options)}`,
+    `📊 ${list}`,
     '👀 Awaiting resolution…',
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
@@ -574,7 +635,9 @@ async function tick() {
     let state = loadState();
     if (!state || !state.markets) state = { markets: {}, seeded: false };
     const knownIds = new Set(Object.keys(state.markets));
-    const toWatch = new Set([...activeIds, ...knownIds]); // keep watching known + current active
+
+    // include trending so we never miss closings
+    const toWatch = new Set([...activeIds, ...trendingIds, ...knownIds]);
 
     console.log('[tick] counts → active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
 
@@ -691,7 +754,7 @@ async function tick() {
         next.announcedOpen = true;
       }
 
-      if (m.status === 'closed' && !prev.announcedClosed) {
+      if (m.status === 'closed' && !prev.announcedClosed && prev.lastStatus !== 'closed') {
         const closedOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
             : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);

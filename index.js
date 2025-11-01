@@ -112,9 +112,8 @@ function humanizeEta(targetMs, nowMs = Date.now()) {
 function cleanLabel(label = '') {
   if (!label) return '';
   let s = label.replace(/^CURRENT\s*[–—-]?\s*/i, '').trim();
-  const banned = ['PROBABILITY','CHART','POOL','SPORTS','WINS','IMPLIED'];
+  const banned = ['PROBABILITY','CHART','POOL','SPORTS','WINS','IMPLIED','HOW IT WORKS','PAYOUTS','RESOLUTION','EARLY CASH-OUT'];
   if (banned.some(b => s.toUpperCase().includes(b))) return '';
-  // collapse spaces
   s = s.replace(/\s+/g, ' ');
   if (s.length > 48) s = s.slice(0, 48);
   return s;
@@ -143,12 +142,9 @@ function uniqueOptions(options = []) {
 function mapWinnerToLabel(winnerRaw, finalOptions = []) {
   if (!winnerRaw) return null;
   const r = winnerRaw.trim().toUpperCase();
-
-  // If it already contains a known label, return that label
   for (const o of finalOptions) {
     if (o?.label && r.includes(o.label.toUpperCase())) return o.label;
   }
-  // Map simple YES/NO/DRAW to positions 0/1/2
   if (r.startsWith('YES'))  return finalOptions[0]?.label || 'YES';
   if (r.startsWith('NO'))   return finalOptions[1]?.label || 'NO';
   if (r.startsWith('DRAW')) return finalOptions[2]?.label || 'DRAW';
@@ -239,6 +235,12 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           return false;
         };
 
+        // reject elements in these sections
+        const isNoise = (el) => {
+          const cls = (el.closest('[class]')?.className || '') + ' ' + (el.id || '');
+          return /(how|works|analysis|faq|help|guide|legal|footer|auracle-analys)/i.test(cls);
+        };
+
         const normalize = (arr) => {
           const out = [];
           const seen = new Set();
@@ -246,7 +248,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             let lbl = (o?.label || '').replace(/^CURRENT\s*[–—-]?\s*/i, '').trim();
             if (!lbl) continue;
             const U = lbl.toUpperCase();
-            if (/(PROBABILITY|CHART|POOL|SPORTS|WINS|IMPLIED)/i.test(U)) continue;
+            if (/(PROBABILITY|CHART|POOL|SPORTS|WINS|IMPLIED|HOW IT WORKS|PAYOUTS|RESOLUTION|EARLY CASH-OUT)/i.test(U)) continue;
             if (seen.has(U)) continue;
             seen.add(U);
             const pct = (o?.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null;
@@ -261,13 +263,28 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           return out;
         };
 
+        // FIRST: “XYZ IMPLIED 33%” boxes (those purple/cyan/yellow panels)
+        const fromImpliedPanels = (root) => {
+          const out = [];
+          const nodes = Array.from(root?.querySelectorAll('*') || []).slice(0, 1000);
+          for (const el of nodes) {
+            if (isNoise(el)) continue;
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (t.length < 4 || t.length > 80) continue;
+            const m = t.match(/^(.+?)\s+IMPLIED[^0-9]*?(\d{1,3})\s*%$/i);
+            if (!m) continue;
+            const label = m[1].trim();
+            const pct   = parseInt(m[2], 10);
+            if (label && Number.isFinite(pct)) out.push({ label, pct });
+            if (out.length >= 3) break;
+          }
+          return out;
+        };
+
+        // SECOND: “place bet rows” – only if inside an options/bet container
         const fromPlaceBetRows = (root) => {
-          const rowSel = [
-            '.option', '.side', '.row',
-            '.left, .center, .right',
-            '[data-option]', '[role="listitem"]',
-            '.market-option', '.market-side'
-          ].join(',');
+          const containers = Array.from(root?.querySelectorAll('[class*="place"],[class*="bet"],[class*="option"],[class*="side"]') || []);
+          const out = [];
           const labelSel = [
             '.label', '.name', '.team', '.option-label',
             '[data-testid="option-label"]', '[data-testid="option-name"]',
@@ -277,32 +294,20 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             '.percent', '.percentage', '.progress-label', '.option-percent',
             '[data-testid="option-percent"]'
           ].join(',');
-          const out = [];
-          const rows = Array.from(root?.querySelectorAll(rowSel) || []);
-          for (const row of rows) {
-            const lblNode = row.querySelector(labelSel);
-            const pctNode = row.querySelector(pctSel);
-            if (!lblNode || !pctNode) continue;
-            const lbl = (lblNode.textContent || '').trim();
-            const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
-            const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
-            if (lbl && pct != null) out.push({ label: lbl, pct });
-            if (out.length >= 3) break;
-          }
-          return out;
-        };
-
-        const fromImpliedPanels = (root) => {
-          const out = [];
-          const nodes = Array.from(root?.querySelectorAll('*') || []).slice(0, 1200);
-          for (const el of nodes) {
-            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-            const m = t.match(/^(.+?)\s+IMPLIED[^0-9]*?(\d{1,3})\s*%$/i);
-            if (!m) continue;
-            const label = m[1].trim();
-            const pct = parseInt(m[2], 10);
-            if (label && Number.isFinite(pct)) out.push({ label, pct });
-            if (out.length >= 3) break;
+          for (const box of containers) {
+            const rows = Array.from(box.querySelectorAll('[class*="option"],[class*="side"],[role="listitem"]')).slice(0,6);
+            for (const row of rows) {
+              if (isNoise(row)) continue;
+              const lblNode = row.querySelector(labelSel);
+              const pctNode = row.querySelector(pctSel);
+              if (!lblNode || !pctNode) continue;
+              const lbl = (lblNode.textContent || '').trim();
+              const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
+              const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
+              if (lbl && pct != null) out.push({ label: lbl, pct });
+              if (out.length >= 3) break;
+            }
+            if (out.length >= 2) break;
           }
           return out;
         };
@@ -347,11 +352,11 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             }
           }
 
-          // options
-          let options = fromPlaceBetRows(cardRoot);
+          // options: prefer IMPLIED panels; fallback to place-bet rows
+          let options = fromImpliedPanels(cardRoot);
           if (options.length < 2) {
-            const implied = fromImpliedPanels(cardRoot);
-            if (implied.length >= 2) options = implied;
+            const rows = fromPlaceBetRows(cardRoot);
+            if (rows.length >= 2) options = rows;
           }
           options = normalize(options);
 
@@ -412,7 +417,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     const text = (el) => (el?.textContent || '').trim();
     const up   = (s) => (s || '').toUpperCase();
 
-    // ---- Title (heuristic)
+    // ---- Title
     const og = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
     const nodes = Array.from(document.querySelectorAll(
       'h1, h2, h3, .market-title, [data-testid="market-title"], .title, .text-3xl, .text-2xl'
@@ -512,6 +517,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       const out = [];
       for (const el of nodes) {
         const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t.length < 4 || t.length > 80) continue;
         const m = t.match(/^(.+?)\s+IMPLIED[^0-9]*?(\d{1,3})\s*%$/i);
         if (!m) continue;
         const label = m[1].trim();
@@ -528,7 +534,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       let L = (o.label || '').trim().replace(/^CURRENT\s*[–—-]?\s*/i, '').replace(/\s+/g, ' ');
       if (!L) continue;
       const U = L.toUpperCase();
-      if (/(PROBABILITY|CHART|POOL|SPORTS|WINS|IMPLIED)/i.test(U)) continue;
+      if (/(PROBABILITY|CHART|POOL|SPORTS|WINS|IMPLIED|HOW IT WORKS|PAYOUTS|RESOLUTION|EARLY CASH-OUT)/i.test(U)) continue;
       const pctVal = (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null;
       if (!byLabel.has(U)) byLabel.set(U, { label: L, pct: pctVal });
       else if (pctVal != null) byLabel.get(U).pct = pctVal;
@@ -720,7 +726,6 @@ async function tick() {
     const trendingById = new Map(trending.map(m => [m.id, m]));
     const base = AURACLE_BASE_URL.replace(/\/+$/, '');
 
-    // Scrape details for all watched markets
     const results = [];
     for (const id of watch) {
       const prev = state.markets[id];
@@ -733,13 +738,11 @@ async function tick() {
       const detail = await scrapeMarketDetail(url, { debug: dbg });
       if (!detail || !detail.id) continue;
 
-      // For open markets, compute endsIn from closeISO if present
       if (detail.status === 'open' && detail.closeISO) {
         const ms = Date.parse(detail.closeISO);
         if (!isNaN(ms)) detail.endsIn = humanizeEta(ms);
       }
 
-      // Prefer list-card options when open
       if (detail.status === 'open') {
         const card = activeById.get(detail.id) || trendingById.get(detail.id);
         if (card?.options?.length >= 2) detail.options = card.options;
@@ -750,7 +753,7 @@ async function tick() {
       results.push(detail);
     }
 
-    // Seed on first run (don’t spam history)
+    // Seed on first run
     if (!state.seeded && results.length) {
       for (const m of results) {
         const inActive = activeById.has(m.id);
@@ -774,7 +777,7 @@ async function tick() {
       return;
     }
 
-    // Update “missing” counter for telemetry only
+    // Update counters
     for (const id of Object.keys(state.markets)) {
       state.markets[id].missingCount =
         (activeIds.has(id) || trendingIds.has(id)) ? 0 : ((state.markets[id].missingCount || 0) + 1);
@@ -807,7 +810,7 @@ async function tick() {
         next.closedSnapshot = { options: finalOpts };
       }
 
-      // New market open (only if in Active list and never announced)
+      // New market open
       if (m.status === 'open' && activeById.has(m.id) && !prev.announcedOpen) {
         const payload = {
           ...m,
@@ -843,7 +846,7 @@ async function tick() {
           'RESOLVED'
         );
         next.announcedResolved = true;
-        next.retired = true; // stop tracking forever after announcing resolution
+        next.retired = true;
       }
 
       // Trending entry

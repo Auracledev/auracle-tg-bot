@@ -85,7 +85,51 @@ function escapeHtml(s = '') {
     .replace(/'/g, '&#39;');
 }
 
-// Turn a future time (ms) into "in about 29 days", etc.
+// ✅ WINNER + OPTION CLEANUP USED EVERYWHERE
+function cleanLabel(label = "") {
+  if (!label) return "";
+  let s = label.trim();
+  const banned = ["PROBABILITY", "CHART", "POOL", "SPORTS", "WINS", "IMPLIED"];
+  if (banned.some(b => s.toUpperCase().includes(b))) return "";
+  if (s.length > 40) s = s.slice(0, 40);
+  return s;
+}
+
+function uniqueOptions(options = []) {
+  const out = [];
+  const seen = new Set();
+  for (const o of options) {
+    if (!o?.label) continue;
+    const lbl = cleanLabel(o.label);
+    if (!lbl) continue;
+    const key = lbl.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ label: lbl, pct: o.pct ?? null });
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
+function mapWinnerToLabel(winnerRaw, options = []) {
+  if (!winnerRaw) return null;
+  const r = winnerRaw.trim().toUpperCase();
+
+  // direct literal match
+  for (const o of options) {
+    if (o.label && r.includes(o.label.toUpperCase())) return o.label;
+  }
+
+  // YES / NO / DRAW mapping
+  if (r.startsWith("YES")) return options[0]?.label ?? "YES";
+  if (r.startsWith("NO"))  return options[1]?.label ?? "NO";
+  if (r.startsWith("DRAW")) return options[2]?.label ?? "DRAW";
+
+  if (r.includes("INVALID")) return "Invalid";
+  return winnerRaw.trim();
+}
+
+// Human time text
 function humanizeEta(targetMs, nowMs = Date.now()) {
   if (!Number.isFinite(targetMs)) return '';
   let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
@@ -100,45 +144,6 @@ function humanizeEta(targetMs, nowMs = Date.now()) {
   if (min >= 2)  return `in about ${min} minutes`;
   if (min === 1) return `in about 1 minute`;
   return `in about moments`;
-}
-
-// Collapse duplicate option rows like "LEVERKUSEN 50%" repeated.
-// Keeps first occurrence per label (case-insensitive), up to 3 total.
-function uniqueOptions(options = []) {
-  const out = [];
-  const seen = new Set();
-  for (const o of options) {
-    if (!o || !o.label) continue;
-    const key = o.label.trim().toUpperCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ label: o.label.trim(), pct: (Number.isFinite(o.pct)? Math.round(o.pct) : null) });
-    if (out.length >= 3) break;
-  }
-  return out;
-}
-
-// Map a raw winner string to the actual option label (YES/NO/DRAW → team names)
-// Falls back to raw winner if no mapping found. Treats INVALID/VOID specially.
-function mapWinnerToLabel(winnerRaw, options = []) {
-  const raw = (winnerRaw || '').trim();
-  if (!raw) return null;
-  const W = raw.toUpperCase();
-
-  // If the resolved text already includes the team/choice name, use that.
-  for (const o of options) {
-    if (!o?.label) continue;
-    if (W.includes(o.label.toUpperCase())) return o.label;
-  }
-  // YES/NO/DRAW to indexed choices
-  if (/^YES\b/i.test(W))  return options[0]?.label || "YES";
-  if (/^NO\b/i.test(W))   return options[1]?.label || "NO";
-  if (/^DRAW\b/i.test(W)) return options[2]?.label || "Draw";
-
-  // Special cases
-  if (/INVALID|VOID/i.test(W)) return "Invalid";
-
-  return raw;
 }
 
 // ---------- Puppeteer (singleton) ----------
@@ -209,6 +214,8 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
 
       const data = await page.evaluate(() => {
         const text = (el) => (el?.textContent || '').trim();
+
+        // Detect "#N HOT" badge anywhere within a card block
         const HAS_HOT = (node) => {
           if (!node) return false;
           const nodes = Array.from(node.querySelectorAll('*:not(script):not(style)')).slice(0, 500);
@@ -231,10 +238,10 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
 
           const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
-          // Category
+          // Category (best-effort)
           const category = text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
 
-          // endsIn: choose largest window found in-card
+          // endsIn text ("in about X hours/days…")
           const MINUTES = (n, unit) => {
             unit = (unit || '').toLowerCase();
             if (unit.startsWith('day'))   return n * 24 * 60;
@@ -263,7 +270,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             }
           }
 
-          // Options
+          // Options with % (best-effort, 2–3 rows)
           const rowSelectors = [
             '.option', '.side', '.row',
             '.left, .center, .right',
@@ -296,9 +303,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             if (options.length >= 3) break;
           }
 
-          // 🔧 Dedupe options to avoid "LEVERKUSEN 50% ×3"
-          // (We'll define uniqueOptions at top level, but we can't call it here inside page context;
-          // so do a simple inline dedupe.)
+          // Simple in-page dedupe (page context; mirror of uniqueOptions)
           const oOut = [];
           const seen = new Set();
           for (const o of options) {
@@ -334,6 +339,8 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
           if (trending) trendingArr.push(entry);
           else activeArr.push(entry);
         }
+
+        // If site only exposes one section shape, treat it as Active
         if (activeArr.length === 0 && trendingArr.length > 0) {
           return { trending: [], active: trendingArr };
         }
@@ -364,8 +371,8 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     const text = (el) => (el?.textContent || '').trim();
     const up = (s) => (s || '').toUpperCase();
 
+    // --- Title (heuristic) ---
     const og = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
-
     const nodes = Array.from(document.querySelectorAll(
       'h1, h2, h3, .market-title, [data-testid="market-title"], .title, .text-3xl, .text-2xl'
     ));
@@ -390,16 +397,6 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       const t = text(n);
       cand.push({ t, s: scoreTitle(t) });
     }
-
-    const pct = document.querySelector('[data-testid="option-percent"], .option-percent, .percentage, .percent');
-    if (pct) {
-      const blk = pct.closest('article, section, div');
-      if (blk) {
-        const localHead = blk.querySelector('h1, h2, h3, .market-title, .title');
-        if (localHead) cand.push({ t: text(localHead), s: scoreTitle(text(localHead)) + 5 });
-      }
-    }
-
     cand.sort((a, b) => b.s - a.s);
     let bestTitle = (cand.find(x => x.s > 0)?.t || '').trim();
     if (!bestTitle) {
@@ -419,7 +416,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 
     let options = [];
 
-    // 1) Primary: rows in “Place Bet” / option rows
+    // 1) Primary: rows in “Place Bet”
     (function primaryOptionRows() {
       if (options.length >= 2) return;
       const rowSelectors = [
@@ -459,8 +456,8 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     })();
 
-    // 2) Fallback A: “CURRENT … 33%” blocks under the chart when closed
-    (function chartCurrentBlocks() {
+    // 2) Fallbacks: "CURRENT X 33%" and "X IMPLIED 33%" and general "%"
+    (function textBlocks() {
       if (options.length >= 2 && options.every(o => o.pct !== null)) return;
       const raw = (document.body?.innerText || '').replace(/\s+/g, ' ');
       const curRe = /CURRENT\s+([A-Za-z0-9@.'’\-&/ ]+?)\s+(\d+)\s*%/gi;
@@ -474,6 +471,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
         const label = m[1].trim(); const pct = parseInt(m[2],10);
         if (label && Number.isFinite(pct)) options.push({ label, pct });
       }
+      // general pairs as very last resort
       const genRe = /([A-Za-z0-9@.'’\-&/ ]+?)\s+(\d+)\s*%/gi;
       let seen = 0;
       while ((m = genRe.exec(raw)) && seen < 6) {
@@ -483,20 +481,21 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     })();
 
-    // Normalize and backfill for 2-way markets
-    // Dedupe by label (case-insensitive), keep top 3
+    // Deduplicate & constrain
+    // (We don't have access to top-level uniqueOptions here; mimic minimal dedupe.)
     const byLabel = new Map();
     for (const o of options) {
       const L = (o.label || '').trim();
       if (!L) continue;
       const U = L.toUpperCase();
+      // ignore obvious noise lines
+      if (/(PROBABILITY|CHART|POOL|SPORTS|WINS|IMPLIED)/i.test(U)) continue;
       if (!byLabel.has(U)) byLabel.set(U, { label: L, pct: o.pct ?? null });
       else if (o.pct != null) byLabel.get(U).pct = o.pct;
     }
     let norm = Array.from(byLabel.values());
     norm.sort((a,b) => (b.label.length - a.label.length));
     norm = norm.slice(0,3);
-
     if (norm.length === 2) {
       const [a,b] = norm;
       if (a.pct != null && b.pct == null) b.pct = Math.max(0, Math.min(100, 100 - a.pct));
@@ -518,7 +517,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     if (winner) status = 'resolved';
     else if (isClosedText) status = 'closed';
 
-    // ---- CLOSE date/time extraction from detail page ----
+    // Close date/time (ISO) best-effort
     function parseCloseTextToDate(text) {
       if (!text) return null;
       const re = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\s+at\s+\d{1,2}:\d{2}\s*(AM|PM)\b/i;
@@ -593,20 +592,30 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
   return data;
 }
 
-// ---------- Message Templates ----------
-function formatOptionsList(options = []) {
-  if (!options.length) return '—';
-  return options.map((o) =>
-    `${escapeHtml(o.label)}: <b>${o.pct ?? '?' }%</b>`
-  ).join('  |  ');
+// ---------- Message Formatting ----------
+
+// escape HTML for Telegram
+function escapeHtml(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
+
+function formatOptionsList(options = []) {
+  if (!options?.length) return '—';
+  return options
+    .map(o => `${escapeHtml(o.label)}: <b>${o.pct ?? '?'}%</b>`)
+    .join(' | ');
+}
+
 function fmtNewMarket(m) {
   const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
   const end = m.endsIn ? `⏳ ${escapeHtml(m.endsIn)}\n` : '';
-  const uniq = uniqueOptions(m.options || []);
-  const lines = uniq.slice(0, 3).map(
-    o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`
-  ).join('\n');
+  const lines = (m.options || [])
+    .slice(0, 3)
+    .map(o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`)
+    .join('\n');
 
   return [
     '🔥 <b>New Market Live on Auracle</b>',
@@ -615,10 +624,9 @@ function fmtNewMarket(m) {
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
+
 function fmtClosed(m) {
-  const uniq = uniqueOptions(m.options || []);
-  const list = uniq
-    .filter(o => o && o.label)
+  const list = (m.options || [])
     .map(o => `${escapeHtml(o.label)} ${o.pct ?? '?'}%`)
     .join(' - ') || '—';
 
@@ -630,23 +638,28 @@ function fmtClosed(m) {
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
+
 function fmtResolved(m) {
-  const uniq = uniqueOptions(m.options || []);
+  const opts = formatOptionsList(m.options);
+  const niceWinner = escapeHtml(m.winner || '—');
+
   return [
     '✅ <b>Market Resolved</b>',
     `🏟️ <b>${escapeHtml(m.title)}</b>`,
-    `🏆 <b>Winner:</b> ${escapeHtml(m.winner ?? '—')}`,
-    `📊 Final: ${formatOptionsList(uniq)}`,
+    `🏆 <b>Winner:</b> ${niceWinner}`,
+    `📊 Final: ${opts}`,
     '💰 Rewards available on Auracle.',
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
+
 function fmtTrending(m) {
   const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
-  const uniq = uniqueOptions(m.options || []);
-  const lines = uniq.slice(0,3).map(
-    o => `• ${escapeHtml(o.label)} — <b>${o.pct ?? '?'}%</b>`
-  ).join('\n');
+  const lines = (m.options || [])
+    .slice(0,3)
+    .map(o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`)
+    .join('\n');
+
   return [
     '📈 <b>Now Trending on Auracle</b>',
     `🏟️ <b>${escapeHtml(m.title)}</b>`,
@@ -655,7 +668,7 @@ function fmtTrending(m) {
   ].join('\n');
 }
 
-// ---------- Telegram send ----------
+// ------------ Telegram Send Helper -------------
 async function send(msg, tag = '') {
   const chatId = getTargetChatId();
   try {
@@ -663,386 +676,198 @@ async function send(msg, tag = '') {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     });
-    if (dbg) console.log(`[send] OK → chat ${chatId} ${tag ? '[' + tag + ']' : ''} message_id=${m?.message_id}`);
+    if (dbg) console.log(`[send] OK to ${chatId}`, tag, m.message_id);
   } catch (e) {
     const desc = e?.response?.description || e.message;
     console.error('[send] ERROR → chat', chatId, desc);
   }
 }
 
-// ---------- Tick ----------
+// ---------- MARKET TICK ENGINE ----------
+
+// convert date to "in about X days"
+function humanizeEta(targetMs, nowMs = Date.now()) {
+  if (!Number.isFinite(targetMs)) return '';
+  let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
+
+  const min = Math.floor(diff / 60);
+  const hr = Math.floor(min / 60);
+  const day = Math.floor(hr / 24);
+
+  if (day >= 2) return `in about ${day} days`;
+  if (day === 1) return `in about 1 day`;
+  if (hr >= 2) return `in about ${hr} hours`;
+  if (hr === 1) return `in about 1 hour`;
+  if (min >= 2) return `in about ${min} minutes`;
+  if (min === 1) return `in about 1 minute`;
+  return `in moments`;
+}
+
 async function tick() {
-  try {
-    console.log('[tick] run at', new Date().toISOString());
+  console.log(`[tick] run @ ${new Date().toISOString()}`);
 
-    const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
+  const state = loadState();
+  const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
 
-    const activeIds   = new Set(active.map(m => m.id).filter(Boolean));
-    const trendingIds = new Set(trending.map(m => m.id).filter(Boolean));
+  const activeIds = new Set(active.map(m => m.id).filter(Boolean));
+  const trendingIds = new Set(trending.map(m => m.id).filter(Boolean));
+  const knownIds = new Set(Object.keys(state.markets || {}));
 
-    let state = loadState();
-    if (!state || !state.markets) state = { markets: {}, seeded: false };
-    const knownIds = new Set(Object.keys(state.markets));
+  // Track all present + known markets
+  const watchIds = new Set([...activeIds, ...trendingIds, ...knownIds]);
 
-    // include trending so we never miss closings
-    const toWatch = new Set([...activeIds, ...trendingIds, ...knownIds]);
-    // ⛔ skip markets we already announced as resolved
-    for (const id of [...toWatch]) {
-      const rec = state.markets[id];
-      if (rec?.retired) toWatch.delete(id);
-    }
+  // Strip retired markets
+  for (const id of [...watchIds]) {
+    if (state.markets[id]?.retired) watchIds.delete(id);
+  }
 
-    console.log('[tick] counts → active:', activeIds.size, 'trending:', trendingIds.size, 'known:', knownIds.size, 'watch:', toWatch.size);
+  console.log(`[tick] tracking: active=${activeIds.size} trending=${trendingIds.size} known=${knownIds.size} → watch ${watchIds.size}`);
 
-    const activeById   = new Map(active.map(m => [m.id, m]));
-    const trendingById = new Map(trending.map(m => [m.id, m]));
+  // map for card lookup
+  const activeById = new Map(active.map(m => [m.id, m]));
+  const trendingById = new Map(trending.map(m => [m.id, m]));
+  const base = AURACLE_BASE_URL.replace(/\/+$/, '');
 
-    const base = AURACLE_BASE_URL.replace(/\/+$/, '');
-    const results = [];
-    for (const id of toWatch) {
-      const known = state.markets[id];
-      const url =
-        known?.url ||
-        activeById.get(id)?.url ||
-        trendingById.get(id)?.url ||
-        `${base}/MarketDetails?id=${id}`;
+  for (const id of watchIds) {
+    const prev = state.markets[id] || {
+      announcedOpen: false,
+      announcedClosed: false,
+      announcedResolved: false,
+      lastStatus: 'unknown',
+      lastSeen: null,
+      closedSnapshot: null,
+      retired: false
+    };
 
-      const detail = await scrapeMarketDetail(url, { debug: dbg });
-      if (!detail || !detail.id) continue;
+    const url =
+      prev.url ||
+      activeById.get(id)?.url ||
+      trendingById.get(id)?.url ||
+      `${base}/MarketDetails?id=${id}`;
 
-      if (detail.status === 'open') {
-        const card = activeById.get(detail.id) || trendingById.get(detail.id);
+    const detail = await scrapeMarketDetail(url, { debug: dbg });
+    if (!detail?.id) continue;
 
-        // Prefer detail.closeISO to compute endsIn
-        if (detail.closeISO) {
-          const ms = Date.parse(detail.closeISO);
-          if (Number.isFinite(ms)) {
-            detail.endsIn = humanizeEta(ms);
-          }
-        }
-        // Fallback to list-card endsIn
-        if (!detail.endsIn && card?.endsIn) {
-          detail.endsIn = card.endsIn;
-        }
+    // use list info when available
+    const card = activeById.get(id) || trendingById.get(id);
 
-        if (card) {
-          detail.category = card.category || detail.category;
-          if (Array.isArray(card.options) && card.options.length >= 2) detail.options = card.options;
-        }
+    // build next state
+    const next = { ...prev, url: detail.url };
+
+    // update last seen for open markets
+    if (detail.status === 'open') {
+      let endsIn = '';
+      if (detail.closeISO) {
+        const ms = Date.parse(detail.closeISO);
+        if (!isNaN(ms)) endsIn = humanizeEta(ms);
       }
+      if (!endsIn && card?.endsIn) endsIn = card.endsIn;
 
-      results.push(detail);
-    }
+      const opts = card?.options?.length
+        ? card.options
+        : detail?.options?.length
+        ? detail.options
+        : prev.lastSeen?.options || [];
 
-    // initial seed
-    if (!state.seeded && results.length) {
-      console.log('[seed] first run — seeding', results.length, 'markets');
-      for (const m of results) {
-        const inActive   = activeById.has(m.id);
-        const card       = activeById.get(m.id) || trendingById.get(m.id);
-        state.markets[m.id] = {
-          announcedOpen:     m.status === 'open' && inActive,
-          announcedClosed:   m.status === 'closed',
-          announcedResolved: m.status === 'resolved',
-          lastStatus:        m.status,
-          url:               m.url,
-          missingCount:      0,
-          wasTrending:       trendingIds.has(m.id),
-          retired:           m.status === 'resolved', // if already resolved on first seed, retire
-          lastSeen:          card ? { title: m.title, category: card.category, endsIn: m.endsIn || card.endsIn, options: card.options } :
-                                    { title: m.title, category: m.category, endsIn: m.endsIn, options: m.options },
-          closedSnapshot:    m.status === 'closed' ? { options: (m.options || []) } : null
-        };
-      }
-      state.seeded = true;
-      saveState(state);
-      console.log('[seed] done');
-      return;
-    }
-
-    console.log('[tick] scraped detail count:', results.length);
-
-    // update "missing" counter (telemetry only)
-    for (const id of Object.keys(state.markets)) {
-      state.markets[id].missingCount =
-        (activeIds.has(id) || trendingIds.has(id)) ? 0 : ((state.markets[id].missingCount || 0) + 1);
-    }
-
-    // transitions + announcements (NO inferred close)
-    for (const m of results) {
-      const prev = state.markets[m.id] || {
-        announcedOpen: false, announcedClosed: false, announcedResolved: false,
-        lastStatus: 'unknown', url: m.url, missingCount: 0, lastSeen: null, closedSnapshot: null, wasTrending: false, retired: false
+      next.lastSeen = {
+        title: detail.title,
+        category: card?.category ?? detail.category,
+        endsIn,
+        options: opts
       };
-      const next = { ...prev, url: m.url };
-
-      if (prev.retired) {
-        // Already retired — skip updates
-        state.markets[m.id] = next;
-        continue;
-      }
-
-      if (m.status === 'open') {
-        const card = activeById.get(m.id) || trendingById.get(m.id);
-        const seenOpts = card?.options?.length ? card.options : m.options;
-        next.lastSeen = {
-          title: m.title,
-          category: card?.category ?? m.category,
-          endsIn: m.endsIn || card?.endsIn || prev.lastSeen?.endsIn || '',
-          options: Array.isArray(seenOpts) ? uniqueOptions(seenOpts) : (prev.lastSeen?.options || [])
-        };
-      }
-
-      // Only trust detail page for closed/resolved
-      if (m.status === 'closed' && !next.closedSnapshot) {
-        const finalOpts = (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || [];
-        next.closedSnapshot = { options: uniqueOptions(finalOpts) };
-      }
-
-      if (m.status === 'open' && activeById.has(m.id) && !prev.announcedOpen) {
-        const card = activeById.get(m.id);
-        const openPayload = {
-          ...m,
-          title: m.title || prev.lastSeen?.title || card?.title || 'Unknown',
-          category: next.lastSeen?.category ?? card?.category ?? m.category,
-          endsIn: next.lastSeen?.endsIn ?? m.endsIn,
-          options: (card?.options?.length ? uniqueOptions(card.options) :
-                    next.lastSeen?.options?.length ? uniqueOptions(next.lastSeen.options) :
-                    uniqueOptions(m.options))
-        };
-        await send(fmtNewMarket(openPayload), 'OPEN');
-        next.announcedOpen = true;
-      }
-
-      if (m.status === 'closed' && !prev.announcedClosed && prev.lastStatus !== 'closed') {
-        const closedOptions =
-          next.closedSnapshot?.options?.length ? next.closedSnapshot.options
-            : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);
-        const closedPayload = { ...m, options: uniqueOptions(closedOptions), title: m.title || prev.lastSeen?.title || 'Unknown' };
-        await send(fmtClosed(closedPayload), 'CLOSED');
-        next.announcedClosed = true;
-      }
-
-      if (m.status === 'resolved' && !prev.announcedResolved) {
-        // Prefer snapshot from close; fallback to lastSeen; then page
-        let finalOptions =
-          (next.closedSnapshot && Array.isArray(next.closedSnapshot.options) && next.closedSnapshot.options.length) ? next.closedSnapshot.options
-            : (prev.lastSeen && Array.isArray(prev.lastSeen.options) && prev.lastSeen.options.length ? prev.lastSeen.options
-            : (Array.isArray(m.options) ? m.options : []));
-        finalOptions = uniqueOptions(finalOptions);
-
-        // Map YES/NO/DRAW to actual label (e.g., "BOSTON CELTICS"), handle INVALID
-        const mappedWinner = mapWinnerToLabel(m.winner, finalOptions) || m.winner || '—';
-
-        const resolvedPayload = {
-          ...m,
-          winner: mappedWinner,
-          options: finalOptions,
-          title: m.title || prev.lastSeen?.title || 'Unknown'
-        };
-
-        await send(fmtResolved(resolvedPayload), 'RESOLVED');
-
-        next.announcedResolved = true;
-        next.retired = true;     // ✅ stop tracking this market forever
-      }
-
-      // Trending enter (announce once on entry)
-      const isTrendingNow = trendingIds.has(m.id);
-      const wasTrendingBefore = !!prev.wasTrending;
-      if (isTrendingNow && !wasTrendingBefore) {
-        const card = activeById.get(m.id) || trendingById.get(m.id);
-        const payload = {
-          ...m,
-          title: m.title || card?.title || prev.lastSeen?.title || 'Unknown',
-          category: card?.category ?? m.category,
-          options: (card?.options?.length ? uniqueOptions(card.options) :
-                    prev.lastSeen?.options?.length ? uniqueOptions(prev.lastSeen.options) :
-                    uniqueOptions(m.options) )
-        };
-        await send(fmtTrending(payload), 'TRENDING');
-      }
-      next.wasTrending = isTrendingNow;
-
-      next.lastStatus = m.status;
-      state.markets[m.id] = next;
     }
 
-    // 🧹 optional cleanup of retired markets (keeps state file bounded)
-    const MAX_RETIRED = 2000;
-    const ids = Object.keys(state.markets);
-    if (ids.length > MAX_RETIRED) {
-      for (const id of ids) {
-        if (state.markets[id]?.retired) delete state.markets[id];
-      }
+    // capture final pool when entering closed
+    if (detail.status === 'closed' && !prev.announcedClosed && !next.closedSnapshot) {
+      const opts = prev.lastSeen?.options?.length
+        ? prev.lastSeen.options
+        : detail.options || [];
+      next.closedSnapshot = { options: opts };
     }
 
-    saveState(state);
-    console.log('[tick] done', summarizeState(state));
-  } catch (e) {
-    console.error('tick error:', e.message);
+    // ---- ANNOUNCE NEW MARKET ----
+    if (detail.status === 'open' && activeById.has(id) && !prev.announcedOpen) {
+      const opts = card?.options?.length
+        ? card.options
+        : prev.lastSeen?.options?.length
+        ? prev.lastSeen.options
+        : detail.options;
+
+      await send(
+        fmtNewMarket({
+          ...detail,
+          category: next.lastSeen?.category,
+          endsIn: next.lastSeen?.endsIn,
+          options: opts
+        }),
+        'OPEN'
+      );
+
+      next.announcedOpen = true;
+    }
+
+    // ---- ANNOUNCE CLOSED ----
+    if (detail.status === 'closed' && !prev.announcedClosed && prev.lastStatus !== 'closed') {
+      const opts =
+        next.closedSnapshot?.options?.length
+          ? next.closedSnapshot.options
+          : prev.lastSeen?.options || detail.options;
+
+      await send(
+        fmtClosed({
+          ...detail,
+          options: opts,
+          title: next.lastSeen?.title || detail.title
+        }),
+        'CLOSED'
+      );
+
+      next.announcedClosed = true;
+    }
+
+    // ---- ANNOUNCE RESOLVED ----
+    if (detail.status === 'resolved' && !prev.announcedResolved) {
+      const opts =
+        next.closedSnapshot?.options?.length
+          ? next.closedSnapshot.options
+          : prev.lastSeen?.options || detail.options;
+
+      await send(
+        fmtResolved({
+          ...detail,
+          options: opts,
+          title: next.lastSeen?.title || detail.title
+        }),
+        'RESOLVED'
+      );
+
+      next.announcedResolved = true;
+      next.retired = true;
+    }
+
+    // ---- ANNOUNCE TRENDING ENTRY ----
+    const trendingNow = trendingIds.has(id);
+    if (trendingNow && !prev.wasTrending) {
+      const opts =
+        card?.options?.length
+          ? card.options
+          : prev.lastSeen?.options || detail.options;
+
+      await send(
+        fmtTrending({
+          ...detail,
+          options: opts,
+          category: next.lastSeen?.category
+        }),
+        'TRENDING'
+      );
+    }
+    next.wasTrending = trendingNow;
+
+    next.lastStatus = detail.status;
+    state.markets[id] = next;
   }
+
+  saveState(state);
+  console.log('[tick] done ✅');
 }
-
-// ---------- Commands ----------
-bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
-
-bot.command('health', async (ctx) => {
-  try {
-    const { trending, active } = await fetchMarketsFromSections({ debug: true });
-
-    const aSample = await Promise.all(
-      active.slice(0,2).map(async (c) => {
-        const d = await scrapeMarketDetail(c.url, { debug: false });
-        return (d?.title || '(no title)').toUpperCase();
-      })
-    );
-    const tSample = await Promise.all(
-      trending.slice(0,2).map(async (c) => {
-        const d = await scrapeMarketDetail(c.url, { debug: false });
-        return (d?.title || '(no title)').toUpperCase();
-      })
-    );
-
-    await ctx.reply(
-      `Active: ${active.length}  |  Trending: ${trending.length}\n` +
-      `Active sample: ${aSample.join(' | ') || '—'}\n` +
-      `Trending sample: ${tSample.join(' | ') || '—'}`
-    );
-  } catch (e) {
-    await ctx.reply(`Fetch failed: ${String(e.message || e).slice(0, 300)}`);
-  }
-});
-
-bot.command('whereami', async (ctx) => {
-  const target = getTargetChatId();
-  const here = ctx.chat?.id;
-  await ctx.reply(`Target chat: ${String(target)}\nThis chat: ${String(here)}\nTip: /set_target here`);
-});
-
-bot.command('set_target', async (ctx) => {
-  const parts = (ctx.message.text || '').trim().split(/\s+/);
-  const arg = parts[1];
-  if (!arg) { await ctx.reply('Usage: /set_target <chatId|here>'); return; }
-  const id = (arg === 'here') ? ctx.chat.id : arg;
-  setTargetChatId(id);
-  await ctx.reply(`OK. Target chat set to: ${id}`);
-});
-
-bot.command('announce_open_now', async (ctx) => {
-  const parts = (ctx.message.text || '').trim().split(/\s+/);
-  const limit = Math.max(1, Math.min(parseInt(parts[1] || '3', 10) || 3, 20));
-
-  const { active } = await fetchMarketsFromSections({ debug: false });
-  let count = 0;
-  for (const card of active.slice(0, limit)) {
-    const detail = await scrapeMarketDetail(card.url, { debug: dbg });
-    const merged = {
-      ...card,
-      id: card.id || detail?.id,
-      url: detail?.url || card.url,
-      title: (detail?.title || 'Unknown').toUpperCase(),
-      options: (card.options?.length ? uniqueOptions(card.options) : uniqueOptions(detail?.options || []))
-    };
-    await send(fmtNewMarket(merged), 'OPEN(TEST)');
-    const st = loadState();
-    st.markets[merged.id] = {
-      ...(st.markets[merged.id] || {}),
-      announcedOpen: true,
-      lastStatus: 'open',
-      url: merged.url,
-      missingCount: 0,
-      wasTrending: false,
-      lastSeen: { title: merged.title, category: merged.category, endsIn: merged.endsIn, options: merged.options }
-    };
-    saveState(st);
-    count++;
-  }
-  await ctx.reply(`Announced ${count} open market(s) to target chat.`);
-});
-
-bot.command('tick_now', async (ctx) => {
-  try {
-    await ctx.reply('Tick started…');
-    await tick();
-    await ctx.reply('Tick finished.');
-  } catch (e) {
-    await ctx.reply(`Tick error: ${e.message || e}`);
-  }
-});
-
-bot.command('state', async (ctx) => {
-  try {
-    const s = summarizeState(loadState());
-    await ctx.reply(
-      `seeded: ${s.seeded}\n` +
-      `target: ${s.targetChatId}\n` +
-      `tracked: ${s.total}\n` +
-      `statuses: open=${s.open}, closed=${s.closed}, resolved=${s.resolved}, retired=${s.retired}\n` +
-      `announced: open=${s.aO}, closed=${s.aC}, resolved=${s.aR}`
-    );
-  } catch { await ctx.reply('state read error'); }
-});
-
-bot.command('reseed_off', async (ctx) => {
-  const st = loadState(); st.seeded = true; saveState(st);
-  await ctx.reply('Seeding disabled (seeded=true).');
-});
-
-// ---------- Boot: bot + robust scheduler ----------
-(async () => {
-  try {
-    await bot.launch();
-    console.log('[bot] started (polling).');
-    await bot.telegram.setMyCommands([
-      { command: 'ping', description: 'Ping the bot' },
-      { command: 'health', description: 'Active/Trending counts (titles from details)' },
-      { command: 'whereami', description: 'Show current & target chat' },
-      { command: 'set_target', description: 'Set target chat id or "here"' },
-      { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
-      { command: 'tick_now', description: 'Run a tick immediately' },
-      { command: 'state', description: 'Show tracked/announced counts' },
-    ]);
-  } catch (e) {
-    console.error('[bot] launch error:', e?.message || e);
-  }
-})();
-
-// Heartbeat every 10s
-setInterval(() => {
-  console.log(`[hb] alive @ ${new Date().toISOString()} uptime=${process.uptime().toFixed(1)}s`);
-}, 10_000);
-
-// Self-rescheduling loop (no cron)
-const intervalSec = Math.max(5, parseInt(POLL_INTERVAL_SECONDS || '30', 10));
-console.log(`[loop] arming self-scheduler every ${intervalSec}s (TZ=${TZ})`);
-async function loopTick() {
-  console.log(`[loop] fire @ ${new Date().toISOString()}`);
-  try {
-    await tick();
-  } catch (e) {
-    console.error('[loop] tick error:', e?.message || e);
-  } finally {
-    setTimeout(loopTick, intervalSec * 1000);
-  }
-}
-loopTick(); // kick off
-
-// ---------- HTTP server ----------
-const server = http.createServer(async (req, res) => {
-  if (req.url === '/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    const st = loadState();
-    res.end(JSON.stringify({ ok: true, now: new Date().toISOString(), ...summarizeState(st) }));
-    return;
-  }
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Auracle Telegram bot is running.\n');
-});
-server.listen(PORT, () => console.log(`[http] listening on :${PORT}`));
-
-// ---------- Shutdown + error traps ----------
-process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
-process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
-process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });
-process.once('SIGTERM', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGTERM'); server.close(); });

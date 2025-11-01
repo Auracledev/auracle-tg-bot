@@ -282,7 +282,7 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             '[data-testid="option-percent"]'
           ].join(',');
 
-          const options = [];
+          let options = [];
           const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
           for (const row of rows) {
             const pctNode = row.querySelector(pctSel);
@@ -296,6 +296,19 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             if (options.length >= 3) break;
           }
 
+          // 🔧 Dedupe options to avoid "LEVERKUSEN 50% ×3"
+          // (We'll define uniqueOptions at top level, but we can't call it here inside page context;
+          // so do a simple inline dedupe.)
+          const oOut = [];
+          const seen = new Set();
+          for (const o of options) {
+            const key = (o.label || '').trim().toUpperCase();
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            oOut.push({ label: (o.label || '').trim(), pct: o.pct });
+            if (oOut.length >= 3) break;
+          }
+
           // ID
           let id = null;
           try {
@@ -303,23 +316,10 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
           } catch {}
 
-// << add this line right after options collection for the card >>
-options = uniqueOptions(options);
-          
-// Dedupe repeated label rows (e.g., "LEVERKUSEN 50%" shown multiple times on the card)
-const cleanOptions = (Array.isArray(options) ? options : []);
-const entry = {
-  id,
-  url: abs,
-  title: '',
-  category,
-  endsIn,
-  options: cleanOptions.length ? cleanOptions.slice(0, 5) : [],
-  status: 'open'
-};
-
-const trending = HAS_HOT(cardRoot);
-entries.push({ entry, trending });
+          const entry = { id, url: abs, title: '', category, endsIn, options: oOut, status: 'open' };
+          const trending = HAS_HOT(cardRoot);
+          entries.push({ entry, trending });
+        }
 
         // Dedup by ID/URL
         const byKey = new Map();
@@ -331,7 +331,8 @@ entries.push({ entry, trending });
         const trendingArr = [];
         const activeArr = [];
         for (const { entry, trending } of byKey.values()) {
-          if (trending) trendingArr.push(entry); else activeArr.push(entry);
+          if (trending) trendingArr.push(entry);
+          else activeArr.push(entry);
         }
         if (activeArr.length === 0 && trendingArr.length > 0) {
           return { trending: [], active: trendingArr };
@@ -461,56 +462,45 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     // 2) Fallback A: “CURRENT … 33%” blocks under the chart when closed
     (function chartCurrentBlocks() {
       if (options.length >= 2 && options.every(o => o.pct !== null)) return;
-      const blocks = Array.from(document.querySelectorAll('*')).filter(el => {
-        const t = (el.textContent || '').toUpperCase();
-        return /CURRENT\s+[A-Z0-9@ ./-]+\s+\d+\s*%/.test(t);
-      });
-      const found = [];
-      for (const el of blocks) {
-        const t = (el.textContent || '').toUpperCase().replace(/\s+/g, ' ').trim();
-        const m = t.match(/CURRENT\s+([A-Z0-9@ ./-]+?)\s+(\d+)\s*%/);
-        if (!m) continue;
-        const label = m[1].trim();
-        const pct = parseInt(m[2], 10);
-        if (label && Number.isFinite(pct)) found.push({ label, pct });
+      const raw = (document.body?.innerText || '').replace(/\s+/g, ' ');
+      const curRe = /CURRENT\s+([A-Za-z0-9@.'’\-&/ ]+?)\s+(\d+)\s*%/gi;
+      let m;
+      while ((m = curRe.exec(raw))) {
+        const label = m[1].trim(); const pct = parseInt(m[2],10);
+        if (label && Number.isFinite(pct)) options.push({ label, pct });
       }
-      if (found.length >= 2) {
-        options = found.slice(0, 3);
+      const impRe = /([A-Za-z0-9@.'’\-&/ ]+?)\s+IMPLIED[^0-9]*(\d+)\s*%/gi;
+      while ((m = impRe.exec(raw))) {
+        const label = m[1].trim(); const pct = parseInt(m[2],10);
+        if (label && Number.isFinite(pct)) options.push({ label, pct });
       }
-    })();
-
-    // 3) Fallback B: “XYZ IMPLIED 33%” panels near the title
-    (function impliedPanels() {
-      if (options.length >= 2 && options.every(o => o.pct !== null)) return;
-      const candidates = Array.from(document.querySelectorAll('*')).filter(el => {
-        const t = (el.textContent || '');
-        return /\bIMPLIED\b/i.test(t) && /%/.test(t) && (t.length <= 120);
-      });
-      const map = new Map(); // label -> pct
-      for (const el of candidates) {
-        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        // Examples: "PSG IMPLIED 33%", "DRAW IMPLIED 56%", "NICE IMPLIED 11%"
-        const m = t.match(/^(.+?)\s+IMPLIED.*?(\d+)\s*%/i);
-        if (!m) continue;
-        const label = m[1].trim();
-        const pct   = parseInt(m[2], 10);
-        if (label && Number.isFinite(pct)) map.set(label.toUpperCase(), pct);
-      }
-      if (map.size >= 2) {
-        const out = Array.from(map.entries()).map(([label, pct]) => ({ label, pct }));
-        options = out.slice(0, 3);
+      const genRe = /([A-Za-z0-9@.'’\-&/ ]+?)\s+(\d+)\s*%/gi;
+      let seen = 0;
+      while ((m = genRe.exec(raw)) && seen < 6) {
+        seen++;
+        const label = m[1].trim(); const pct = parseInt(m[2],10);
+        if (label && Number.isFinite(pct) && label.length >= 2) options.push({ label, pct });
       }
     })();
 
     // Normalize and backfill for 2-way markets
-    options = options.map((o, i) => ({
-      label: (o.label || (i === 2 ? 'Draw' : `Option ${i+1}`)).trim(),
-      pct: (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null
-    }));
-    if (options.length === 2) {
-      const [a, b] = options;
-      if (a.pct != null && b.pct == null) b.pct = 100 - a.pct;
-      if (b.pct != null && a.pct == null) a.pct = 100 - b.pct;
+    // Dedupe by label (case-insensitive), keep top 3
+    const byLabel = new Map();
+    for (const o of options) {
+      const L = (o.label || '').trim();
+      if (!L) continue;
+      const U = L.toUpperCase();
+      if (!byLabel.has(U)) byLabel.set(U, { label: L, pct: o.pct ?? null });
+      else if (o.pct != null) byLabel.get(U).pct = o.pct;
+    }
+    let norm = Array.from(byLabel.values());
+    norm.sort((a,b) => (b.label.length - a.label.length));
+    norm = norm.slice(0,3);
+
+    if (norm.length === 2) {
+      const [a,b] = norm;
+      if (a.pct != null && b.pct == null) b.pct = Math.max(0, Math.min(100, 100 - a.pct));
+      if (b.pct != null && a.pct == null) a.pct = Math.max(0, Math.min(100, 100 - b.pct));
     }
 
     // Status / resolution
@@ -519,7 +509,9 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     const isClosedText = pageTextUP.includes('ORACLE CLOSED - AWAITING RESOLUTION');
 
     let winner = null;
-    const resolvedMatch = pageTextRaw.match(/ORACLE RESOLVED:\s*(.+)$/mi);
+    const resolvedMatch =
+      pageTextRaw.match(/ORACLE\s+RESOLVED\s*[:\-]\s*([^\n\r]+)/i) ||
+      pageTextRaw.match(/ORACLE\s+RESOLVED\s*(?:\r?\n)+\s*([^\n\r]+)/i);
     if (resolvedMatch && resolvedMatch[1]) winner = resolvedMatch[1].trim();
 
     let status = 'open';
@@ -589,7 +581,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 
     return {
       id, title: bestTitle, url: location.href,
-      status, options, winner: winner || null,
+      status, options: norm, winner: winner || null,
       endsIn: '',
       closeISO: closeISO || '',
       closeText: closeText || ''
@@ -611,7 +603,8 @@ function formatOptionsList(options = []) {
 function fmtNewMarket(m) {
   const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
   const end = m.endsIn ? `⏳ ${escapeHtml(m.endsIn)}\n` : '';
-  const lines = (m.options || []).slice(0, 3).map(
+  const uniq = uniqueOptions(m.options || []);
+  const lines = uniq.slice(0, 3).map(
     o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`
   ).join('\n');
 
@@ -623,7 +616,8 @@ function fmtNewMarket(m) {
   ].join('\n');
 }
 function fmtClosed(m) {
-  const list = (m.options || [])
+  const uniq = uniqueOptions(m.options || []);
+  const list = uniq
     .filter(o => o && o.label)
     .map(o => `${escapeHtml(o.label)} ${o.pct ?? '?'}%`)
     .join(' - ') || '—';
@@ -637,11 +631,12 @@ function fmtClosed(m) {
   ].join('\n');
 }
 function fmtResolved(m) {
+  const uniq = uniqueOptions(m.options || []);
   return [
     '✅ <b>Market Resolved</b>',
     `🏟️ <b>${escapeHtml(m.title)}</b>`,
     `🏆 <b>Winner:</b> ${escapeHtml(m.winner ?? '—')}`,
-    `📊 Final: ${formatOptionsList(m.options)}`,
+    `📊 Final: ${formatOptionsList(uniq)}`,
     '💰 Rewards available on Auracle.',
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
@@ -760,7 +755,6 @@ async function tick() {
         };
       }
       state.seeded = true;
-      // optional GC on seed
       saveState(state);
       console.log('[seed] done');
       return;
@@ -795,14 +789,14 @@ async function tick() {
           title: m.title,
           category: card?.category ?? m.category,
           endsIn: m.endsIn || card?.endsIn || prev.lastSeen?.endsIn || '',
-          options: Array.isArray(seenOpts) ? seenOpts : (prev.lastSeen?.options || [])
+          options: Array.isArray(seenOpts) ? uniqueOptions(seenOpts) : (prev.lastSeen?.options || [])
         };
       }
 
       // Only trust detail page for closed/resolved
       if (m.status === 'closed' && !next.closedSnapshot) {
         const finalOpts = (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || [];
-        next.closedSnapshot = { options: finalOpts };
+        next.closedSnapshot = { options: uniqueOptions(finalOpts) };
       }
 
       if (m.status === 'open' && activeById.has(m.id) && !prev.announcedOpen) {
@@ -812,9 +806,9 @@ async function tick() {
           title: m.title || prev.lastSeen?.title || card?.title || 'Unknown',
           category: next.lastSeen?.category ?? card?.category ?? m.category,
           endsIn: next.lastSeen?.endsIn ?? m.endsIn,
-          options: (card?.options?.length ? card.options :
-                    next.lastSeen?.options?.length ? next.lastSeen.options :
-                    m.options)
+          options: (card?.options?.length ? uniqueOptions(card.options) :
+                    next.lastSeen?.options?.length ? uniqueOptions(next.lastSeen.options) :
+                    uniqueOptions(m.options))
         };
         await send(fmtNewMarket(openPayload), 'OPEN');
         next.announcedOpen = true;
@@ -824,36 +818,36 @@ async function tick() {
         const closedOptions =
           next.closedSnapshot?.options?.length ? next.closedSnapshot.options
             : (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options);
-        const closedPayload = { ...m, options: closedOptions, title: m.title || prev.lastSeen?.title || 'Unknown' };
+        const closedPayload = { ...m, options: uniqueOptions(closedOptions), title: m.title || prev.lastSeen?.title || 'Unknown' };
         await send(fmtClosed(closedPayload), 'CLOSED');
         next.announcedClosed = true;
       }
 
-if (m.status === 'resolved' && !prev.announcedResolved) {
-  // Prefer the snapshot taken at close; else lastSeen; else whatever we have on page.
-  let finalOptions =
-    (next.closedSnapshot && Array.isArray(next.closedSnapshot.options) && next.closedSnapshot.options.length) ? next.closedSnapshot.options
-      : (prev.lastSeen && Array.isArray(prev.lastSeen.options) && prev.lastSeen.options.length ? prev.lastSeen.options
-      : (Array.isArray(m.options) ? m.options : []));
+      if (m.status === 'resolved' && !prev.announcedResolved) {
+        // Prefer snapshot from close; fallback to lastSeen; then page
+        let finalOptions =
+          (next.closedSnapshot && Array.isArray(next.closedSnapshot.options) && next.closedSnapshot.options.length) ? next.closedSnapshot.options
+            : (prev.lastSeen && Array.isArray(prev.lastSeen.options) && prev.lastSeen.options.length ? prev.lastSeen.options
+            : (Array.isArray(m.options) ? m.options : []));
+        finalOptions = uniqueOptions(finalOptions);
 
-  finalOptions = uniqueOptions(finalOptions);
+        // Map YES/NO/DRAW to actual label (e.g., "BOSTON CELTICS"), handle INVALID
+        const mappedWinner = mapWinnerToLabel(m.winner, finalOptions) || m.winner || '—';
 
-  // Map “YES/NO/DRAW” to actual label (e.g., "BOSTON CELTICS")
-  const mappedWinner = mapWinnerToLabel(m.winner, finalOptions) || m.winner || '—';
+        const resolvedPayload = {
+          ...m,
+          winner: mappedWinner,
+          options: finalOptions,
+          title: m.title || prev.lastSeen?.title || 'Unknown'
+        };
 
-  const resolvedPayload = {
-    ...m,
-    winner: mappedWinner,
-    options: finalOptions,
-    title: m.title || prev.lastSeen?.title || 'Unknown'
-  };
+        await send(fmtResolved(resolvedPayload), 'RESOLVED');
 
-  await send(fmtResolved(resolvedPayload), 'RESOLVED');
-  next.announcedResolved = true;
-  next.retired = true;     // stop tracking
-}
+        next.announcedResolved = true;
+        next.retired = true;     // ✅ stop tracking this market forever
+      }
 
-      // Trending enter
+      // Trending enter (announce once on entry)
       const isTrendingNow = trendingIds.has(m.id);
       const wasTrendingBefore = !!prev.wasTrending;
       if (isTrendingNow && !wasTrendingBefore) {
@@ -862,9 +856,9 @@ if (m.status === 'resolved' && !prev.announcedResolved) {
           ...m,
           title: m.title || card?.title || prev.lastSeen?.title || 'Unknown',
           category: card?.category ?? m.category,
-          options: (card?.options?.length ? card.options :
-                    prev.lastSeen?.options?.length ? prev.lastSeen.options :
-                    m.options) || []
+          options: (card?.options?.length ? uniqueOptions(card.options) :
+                    prev.lastSeen?.options?.length ? uniqueOptions(prev.lastSeen.options) :
+                    uniqueOptions(m.options) )
         };
         await send(fmtTrending(payload), 'TRENDING');
       }
@@ -948,7 +942,7 @@ bot.command('announce_open_now', async (ctx) => {
       id: card.id || detail?.id,
       url: detail?.url || card.url,
       title: (detail?.title || 'Unknown').toUpperCase(),
-      options: (card.options?.length ? card.options : detail?.options || [])
+      options: (card.options?.length ? uniqueOptions(card.options) : uniqueOptions(detail?.options || []))
     };
     await send(fmtNewMarket(merged), 'OPEN(TEST)');
     const st = loadState();

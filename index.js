@@ -6,7 +6,9 @@ import { Telegraf } from 'telegraf';
 import puppeteer from 'puppeteer';
 import http from 'http';
 
-// ---------- Paths / Env ----------
+/* =========================
+   ENV / PATHS
+========================= */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -17,7 +19,7 @@ const {
   POLL_INTERVAL_SECONDS = '30',
   DATA_DIR = '/data',
   DEBUG,
-  PORT = process.env.PORT || 3000,
+  PORT = process.env.PORT || 8080,
   TZ = process.env.TZ || 'UTC'
 } = process.env;
 
@@ -28,10 +30,14 @@ if (!TELEGRAM_BOT_TOKEN) {
   process.exit(1);
 }
 
-// ---------- Telegram ----------
+/* =========================
+   TELEGRAM
+========================= */
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// ---------- State ----------
+/* =========================
+   STATE
+========================= */
 const STATE_DIR = path.resolve(DATA_DIR);
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -76,74 +82,22 @@ function setTargetChatId(id) {
   return id;
 }
 
-// ---------- Utils ----------
+/* =========================
+   UTILS
+========================= */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function escapeHtml(s = '') {
   return String(s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
-
-// Winner/option cleanup
-function cleanLabel(label = "") {
-  if (!label) return "";
-  // strip leading "CURRENT " (and any em/en dashes right after)
-  let s = label.replace(/^CURRENT\s*[–—-]?\s*/i, "").trim();
-
-  // drop obvious noise tokens
-  const banned = ["PROBABILITY", "CHART", "POOL", "SPORTS", "WINS", "IMPLIED"];
-  if (banned.some(b => s.toUpperCase().includes(b))) return "";
-
-  // collapse inner whitespace
-  s = s.replace(/\s+/g, " ");
-
-  // keep it tidy
-  if (s.length > 40) s = s.slice(0, 40);
-  return s;
-}
-function uniqueOptions(options = []) {
-  const out = [];
-  const seen = new Set();
-  for (const o of options) {
-    if (!o?.label) continue;
-    const lbl = cleanLabel(o.label);
-    if (!lbl) continue;
-    const key = lbl.toUpperCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ label: lbl, pct: o.pct ?? null });
-    if (out.length >= 3) break;
-  }
-  return out;
-}
-function mapWinnerToLabel(winnerRaw, options = []) {
-  if (!winnerRaw) return null;
-  const r = winnerRaw.trim().toUpperCase();
-
-  // direct contains match against known option labels
-  for (const o of options) {
-    if (o.label && r.includes(o.label.toUpperCase())) return o.label;
-  }
-
-  // YES / NO / DRAW mapping by position
-  if (r.startsWith("YES"))  return options[0]?.label ?? "YES";
-  if (r.startsWith("NO"))   return options[1]?.label ?? "NO";
-  if (r.startsWith("DRAW")) return options[2]?.label ?? "DRAW";
-
-  if (r.includes("INVALID")) return "Invalid";
-  return winnerRaw.trim();
-}
-
-// Turn future ISO -> "in about X"
 function humanizeEta(targetMs, nowMs = Date.now()) {
   if (!Number.isFinite(targetMs)) return '';
   let diff = Math.max(0, Math.floor((targetMs - nowMs) / 1000));
   const min = Math.floor(diff / 60);
   const hr  = Math.floor(min / 60);
   const day = Math.floor(hr / 24);
-
   if (day >= 2)  return `in about ${day} days`;
   if (day === 1) return `in about 1 day`;
   if (hr  >= 2)  return `in about ${hr} hours`;
@@ -153,9 +107,58 @@ function humanizeEta(targetMs, nowMs = Date.now()) {
   return `in about moments`;
 }
 
-// ---------- Puppeteer (singleton) ----------
-let browser = null;
+// normalize noisy labels (e.g., "CURRENT — X", noisy tokens)
+function cleanLabel(label = '') {
+  if (!label) return '';
+  let s = label.replace(/^CURRENT\s*[–—-]?\s*/i, '').trim();
+  const banned = ['PROBABILITY', 'CHART', 'POOL', 'SPORTS', 'WINS', 'IMPLIED'];
+  if (banned.some(b => s.toUpperCase().includes(b))) return '';
+  s = s.replace(/\s+/g, ' ');
+  if (s.length > 40) s = s.slice(0, 40);
+  return s;
+}
 
+// dedupe and keep up to 3 options
+function uniqueOptions(options = []) {
+  const out = [];
+  const seen = new Set();
+  for (const o of options) {
+    const lbl = cleanLabel(o?.label || '');
+    if (!lbl) continue;
+    const key = lbl.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ label: lbl, pct: o.pct ?? null });
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
+// Try to turn "YES/NO/DRAW" resolved strings into actual option label
+function mapWinnerToLabel(winnerRaw, options = []) {
+  if (!winnerRaw) return null;
+  const r = winnerRaw.trim();
+  const R = r.toUpperCase();
+
+  // exact contains
+  for (const o of options) {
+    if (!o?.label) continue;
+    const L = o.label.toUpperCase();
+    if (R.includes(L)) return o.label;
+  }
+  // YES/NO/DRAW mapping fallback
+  if (R.startsWith('YES')) return options[0]?.label ?? 'YES';
+  if (R.startsWith('NO'))  return options[1]?.label ?? 'NO';
+  if (R.startsWith('DRAW')) return options[2]?.label ?? 'DRAW';
+  if (R.includes('INVALID')) return 'Invalid';
+
+  return r;
+}
+
+/* =========================
+   PUPPETEER
+========================= */
+let browser = null;
 async function getBrowser() {
   if (browser) return browser;
   browser = await puppeteer.launch({
@@ -199,7 +202,9 @@ async function autoScroll(page) {
   });
 }
 
-// ---------- List Scraper (Active vs Trending) ----------
+/* =========================
+   LIST SCRAPER (Active vs Trending)
+========================= */
 async function fetchMarketsFromSections({ debug = false } = {}) {
   const base = AURACLE_BASE_URL.replace(/\/+$/, '');
   const now = Date.now();
@@ -222,7 +227,6 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
       const data = await page.evaluate(() => {
         const text = (el) => (el?.textContent || '').trim();
 
-        // Detect "#N HOT" badge anywhere within a card block
         const HAS_HOT = (node) => {
           if (!node) return false;
           const nodes = Array.from(node.querySelectorAll('*:not(script):not(style)')).slice(0, 500);
@@ -237,106 +241,138 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
         const seenUrls = new Set();
         const entries = [];
 
-for (const a of anchors) {
-  const href = a.getAttribute('href') || '';
-  const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
-  if (seenUrls.has(abs)) continue;
-  seenUrls.add(abs);
+        for (const a of anchors) {
+          const href = a.getAttribute('href') || '';
+          const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
+          if (seenUrls.has(abs)) continue;
+          seenUrls.add(abs);
 
-  const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
+          const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
-  // Category (best-effort)
-  const category = text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
+          // Category (best-effort)
+          const category = text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
 
-  // endsIn text ("in about X hours/days…")
-  const MINUTES = (n, unit) => {
-    unit = (unit || '').toLowerCase();
-    if (unit.startsWith('day'))   return n * 24 * 60;
-    if (unit.startsWith('hour'))  return n * 60;
-    if (unit.startsWith('min'))   return n;
-    return n;
-  };
-  let endsIn = '';
-  let bestMins = -1;
-  const timeNodes = Array.from(
-    cardRoot?.querySelectorAll(
-      'time, [data-testid="ends-in"], .ends-in, .text-xs, .text-sm, [class*="ends"], [class*="countdown"]'
-    ) || []
-  );
-  for (const el of timeNodes) {
-    const t = (el.textContent || '').trim();
-    const re = /\b(?:in\s+about|about|in)\s+(\d+)\s*(days?|hours?|minutes?)\b/i;
-    const m = t.match(re);
-    if (m) {
-      const n = parseInt(m[1], 10);
-      const mins = MINUTES(n, m[2]);
-      if (Number.isFinite(mins) && mins > bestMins) {
-        bestMins = mins;
-        endsIn = t;
-      }
+          // endsIn text
+          const MINUTES = (n, unit) => {
+            unit = (unit || '').toLowerCase();
+            if (unit.startsWith('day'))   return n * 24 * 60;
+            if (unit.startsWith('hour'))  return n * 60;
+            if (unit.startsWith('min'))   return n;
+            return n;
+          };
+          let endsIn = '';
+          let bestMins = -1;
+          const timeNodes = Array.from(
+            cardRoot?.querySelectorAll(
+              'time, [data-testid="ends-in"], .ends-in, .text-xs, .text-sm, [class*="ends"], [class*="countdown"]'
+            ) || []
+          );
+          for (const el of timeNodes) {
+            const t = (el.textContent || '').trim();
+            const re = /\b(?:in\s+about|about|in)\s+(\d+)\s*(days?|hours?|minutes?)\b/i;
+            const m = t.match(re);
+            if (m) {
+              const n = parseInt(m[1], 10);
+              const mins = MINUTES(n, m[2]);
+              if (Number.isFinite(mins) && mins > bestMins) {
+                bestMins = mins;
+                endsIn = t;
+              }
+            }
+          }
+
+          // Options with % (best-effort, 2–3 rows)
+          const rowSelectors = [
+            '.option', '.side', '.row',
+            '.left, .center, .right',
+            '[data-option]', '[role="listitem"]',
+            '.market-option', '.market-side'
+          ].join(',');
+
+          const labelSel = [
+            '.label', '.name', '.team', '.option-label',
+            '[data-testid="option-label"]', '[data-testid="option-name"]',
+            'strong', 'span', 'p'
+          ].join(',');
+
+          const pctSel = [
+            '.percent', '.percentage', '.progress-label', '.option-percent',
+            '[data-testid="option-percent"]'
+          ].join(',');
+
+          let options = [];
+          const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
+          for (const row of rows) {
+            const pctNode = row.querySelector(pctSel);
+            const lblNode = row.querySelector(labelSel);
+            if (!pctNode || !lblNode) continue;
+            const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
+            const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
+            const rawLabel = (lblNode.textContent || '').trim();
+            if (!rawLabel || pct === null) continue;
+            options.push({ label: rawLabel, pct });
+            if (options.length >= 3) break;
+          }
+
+          // de-dupe + normalize labels (strip leading "CURRENT " and dashes)
+          const oOut = [];
+          const seen = new Set();
+          for (const o of options) {
+            const raw = (o.label || '').trim();
+            const lbl = raw.replace(/^CURRENT\s*[–—-]?\s*/i, '').replace(/\s+/g, ' ');
+            const key = lbl.toUpperCase();
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            oOut.push({ label: lbl, pct: o.pct });
+            if (oOut.length >= 3) break;
+          }
+
+          // ID
+          let id = null;
+          try {
+            const u = new URL(abs);
+            id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
+          } catch {}
+
+          const entry = { id, url: abs, title: '', category, endsIn, options: oOut, status: 'open' };
+          const trending = HAS_HOT(cardRoot);
+          entries.push({ entry, trending });
+        }
+
+        // Dedup by ID/URL
+        const byKey = new Map();
+        for (const { entry, trending } of entries) {
+          const key = entry.id || entry.url;
+          if (!byKey.has(key)) byKey.set(key, { entry, trending });
+        }
+
+        const trendingArr = [];
+        const activeArr = [];
+        for (const { entry, trending } of byKey.values()) {
+          if (trending) trendingArr.push(entry);
+          else activeArr.push(entry);
+        }
+
+        // If only one shape present, treat as Active
+        if (activeArr.length === 0 && trendingArr.length > 0) {
+          return { trending: [], active: trendingArr };
+        }
+        return { trending: trendingArr, active: activeArr };
+      });
+
+      await page.close();
+      if (debug || dbg) console.log('[sections] trending:', data.trending.length, 'active:', data.active.length);
+      return data;
+    } catch (err) {
+      if (debug || dbg) console.log('[sections] error', err.message);
     }
   }
-
-  // Options with % (best-effort, 2–3 rows)
-  const rowSelectors = [
-    '.option', '.side', '.row',
-    '.left, .center, .right',
-    '[data-option]', '[role="listitem"]',
-    '.market-option', '.market-side'
-  ].join(',');
-
-  const labelSel = [
-    '.label', '.name', '.team', '.option-label',
-    '[data-testid="option-label"]', '[data-testid="option-name"]',
-    'strong', 'span', 'p'
-  ].join(',');
-
-  const pctSel = [
-    '.percent', '.percentage', '.progress-label', '.option-percent',
-    '[data-testid="option-percent"]'
-  ].join(',');
-
-  let options = [];
-  const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
-  for (const row of rows) {
-    const pctNode = row.querySelector(pctSel);
-    const lblNode = row.querySelector(labelSel);
-    if (!pctNode || !lblNode) continue;
-    const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
-    const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
-    const rawLabel = (lblNode.textContent || '').trim();
-    if (!rawLabel || pct === null) continue;
-    options.push({ label: rawLabel, pct });
-    if (options.length >= 3) break;
-  }
-
-  // ✅ de-dupe + normalize labels (strip leading "CURRENT " and dashes)
-  const oOut = [];
-  const seen = new Set();
-  for (const o of options) {
-    const raw = (o.label || '').trim();
-    const lbl = raw.replace(/^CURRENT\s*[–—-]?\s*/i, '').replace(/\s+/g, ' ');
-    const key = lbl.toUpperCase();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    oOut.push({ label: lbl, pct: o.pct });
-    if (oOut.length >= 3) break;
-  }
-
-  // ID
-  let id = null;
-  try {
-    const u = new URL(abs);
-    id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
-  } catch {}
-
-  // Build entry
-  const entry = { id, url: abs, title: '', category, endsIn, options: oOut, status: 'open' };
-  const trending = HAS_HOT(cardRoot);
-  entries.push({ entry, trending });
+  return { trending: [], active: [] };
 }
 
-// ---------- Detail Scraper ----------
+/* =========================
+   DETAIL SCRAPER
+========================= */
 async function scrapeMarketDetail(url, { debug = false } = {}) {
   const page = await newPage();
   if (debug || dbg) console.log('[detail] goto', url);
@@ -350,7 +386,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     const text = (el) => (el?.textContent || '').trim();
     const up = (s) => (s || '').toUpperCase();
 
-    // --- Title (heuristic) ---
+    // Title heuristics
     const og = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
     const nodes = Array.from(document.querySelectorAll(
       'h1, h2, h3, .market-title, [data-testid="market-title"], .title, .text-3xl, .text-2xl'
@@ -385,7 +421,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       bestTitle = parts[0] || dt;
     }
 
-    // ---------- OPTIONS / PERCENTAGES ----------
+    // OPTION/PCT extraction
     const getPctFromNode = (node) => {
       if (!node) return null;
       const s = (node.textContent || '').replace('%','').replace(/[^\d.]/g,'');
@@ -395,7 +431,7 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
 
     let options = [];
 
-    // 1) Primary: rows in “Place Bet”
+    // Primary: option rows
     (function primaryOptionRows() {
       if (options.length >= 2) return;
       const rowSelectors = [
@@ -423,9 +459,9 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
           const out = rows.map((row, i) => {
             const labelNode = row.querySelector(labelSelectors);
             const pctNode   = row.querySelector(percentSelectors);
-            const label = (labelNode?.textContent || '').trim() || `Option ${i+1}`;
-            const pct   = getPctFromNode(pctNode);
-            return { label, pct: Number.isFinite(pct) ? pct : null };
+            const rawLabel  = (labelNode?.textContent || '').trim() || `Option ${i+1}`;
+            const pct       = getPctFromNode(pctNode);
+            return { label: rawLabel, pct: Number.isFinite(pct) ? pct : null };
           }).filter(o => o.label || o.pct !== null);
           if (out.filter(o => o.label).length >= 2) {
             options = out.slice(0, 3);
@@ -435,22 +471,25 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     })();
 
-    // 2) Fallbacks: "CURRENT X 33%" and "X IMPLIED 33%" and general "%"
+    // Fallbacks: "CURRENT X 33%" and "X IMPLIED 33%" and general "%"
     (function textBlocks() {
       if (options.length >= 2 && options.every(o => o.pct !== null)) return;
       const raw = (document.body?.innerText || '').replace(/\s+/g, ' ');
+
       const curRe = /CURRENT\s+([A-Za-z0-9@.'’\-&/ ]+?)\s+(\d+)\s*%/gi;
       let m;
       while ((m = curRe.exec(raw))) {
         const label = m[1].trim(); const pct = parseInt(m[2],10);
         if (label && Number.isFinite(pct)) options.push({ label, pct });
       }
+
       const impRe = /([A-Za-z0-9@.'’\-&/ ]+?)\s+IMPLIED[^0-9]*(\d+)\s*%/gi;
       while ((m = impRe.exec(raw))) {
         const label = m[1].trim(); const pct = parseInt(m[2],10);
         if (label && Number.isFinite(pct)) options.push({ label, pct });
       }
-      // general pairs as very last resort
+
+      // very last resort, broad matches
       const genRe = /([A-Za-z0-9@.'’\-&/ ]+?)\s+(\d+)\s*%/gi;
       let seen = 0;
       while ((m = genRe.exec(raw)) && seen < 6) {
@@ -460,19 +499,19 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
       }
     })();
 
-    // De-dup & limit
+    // Normalize/dedupe + infer missing for 2-way
     const byLabel = new Map();
     for (const o of options) {
-      const L = (o.label || '').trim();
+      let L = (o.label || '').trim().replace(/^CURRENT\s*[–—-]?\s*/i, '').replace(/\s+/g, ' ');
       if (!L) continue;
       const U = L.toUpperCase();
       if (/(PROBABILITY|CHART|POOL|SPORTS|WINS|IMPLIED)/i.test(U)) continue;
-      if (!byLabel.has(U)) byLabel.set(U, { label: L, pct: o.pct ?? null });
-      else if (o.pct != null) byLabel.get(U).pct = o.pct;
+      const pctVal = (o.pct != null && o.pct >= 0 && o.pct <= 100) ? Math.round(o.pct) : null;
+      if (!byLabel.has(U)) byLabel.set(U, { label: L, pct: pctVal });
+      else if (pctVal != null) byLabel.get(U).pct = pctVal;
     }
     let norm = Array.from(byLabel.values());
-    norm.sort((a,b) => (b.label.length - a.label.length));
-    norm = norm.slice(0,3);
+    norm = norm.slice(0, 3);
     if (norm.length === 2) {
       const [a,b] = norm;
       if (a.pct != null && b.pct == null) b.pct = Math.max(0, Math.min(100, 100 - a.pct));
@@ -480,14 +519,14 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
     }
 
     // Status / resolution
-    const pageTextRaw = document.body?.innerText || '';
-    const pageTextUP  = up(pageTextRaw);
-    const isClosedText = pageTextUP.includes('ORACLE CLOSED - AWAITING RESOLUTION');
+    const bodyText = (document.body?.innerText || '');
+    const bodyUP = bodyText.toUpperCase();
+    const isClosedText = bodyUP.includes('ORACLE CLOSED - AWAITING RESOLUTION');
 
     let winner = null;
     const resolvedMatch =
-      pageTextRaw.match(/ORACLE\s+RESOLVED\s*[:\-]\s*([^\n\r]+)/i) ||
-      pageTextRaw.match(/ORACLE\s+RESOLVED\s*(?:\r?\n)+\s*([^\n\r]+)/i);
+      bodyText.match(/ORACLE\s+RESOLVED\s*[:\-]\s*([^\n\r]+)/i) ||
+      bodyText.match(/ORACLE\s+RESOLVED\s*(?:\r?\n)+\s*([^\n\r]+)/i);
     if (resolvedMatch && resolvedMatch[1]) winner = resolvedMatch[1].trim();
 
     let status = 'open';
@@ -569,21 +608,20 @@ async function scrapeMarketDetail(url, { debug = false } = {}) {
   return data;
 }
 
-// ---------- Message Formatting ----------
+/* =========================
+   MESSAGE TEMPLATES
+========================= */
 function formatOptionsList(options = []) {
-  if (!options?.length) return '—';
-  return options
-    .map(o => `${escapeHtml(o.label)}: <b>${o.pct ?? '?'}%</b>`)
-    .join(' | ');
+  const opts = uniqueOptions(options);
+  if (!opts.length) return '—';
+  return opts.map(o => `${escapeHtml(o.label)}: <b>${o.pct ?? '?'}%</b>`).join('  |  ');
 }
-
 function fmtNewMarket(m) {
   const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
   const end = m.endsIn ? `⏳ ${escapeHtml(m.endsIn)}\n` : '';
-  const lines = (m.options || [])
-    .slice(0, 3)
-    .map(o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`)
-    .join('\n');
+  const lines = uniqueOptions(m.options || []).slice(0, 3).map(
+    o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`
+  ).join('\n');
 
   return [
     '🔥 <b>New Market Live on Auracle</b>',
@@ -592,9 +630,8 @@ function fmtNewMarket(m) {
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
-
 function fmtClosed(m) {
-  const list = (m.options || [])
+  const list = uniqueOptions(m.options || [])
     .map(o => `${escapeHtml(o.label)} ${o.pct ?? '?'}%`)
     .join(' - ') || '—';
 
@@ -606,28 +643,23 @@ function fmtClosed(m) {
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
-
 function fmtResolved(m) {
-  const opts = formatOptionsList(m.options);
-  const niceWinner = escapeHtml(m.winner || '—');
-
+  // winner mapping
+  const niceWinner = mapWinnerToLabel(m.winner, uniqueOptions(m.options || [])) || m.winner || '—';
   return [
     '✅ <b>Market Resolved</b>',
     `🏟️ <b>${escapeHtml(m.title)}</b>`,
-    `🏆 <b>Winner:</b> ${niceWinner}`,
-    `📊 Final: ${opts}`,
+    `🏆 <b>Winner:</b> ${escapeHtml(niceWinner)}`,
+    `📊 Final: ${formatOptionsList(m.options)}`,
     '💰 Rewards available on Auracle.',
     `🔗 ${escapeHtml(m.url)}`
   ].join('\n');
 }
-
 function fmtTrending(m) {
   const cat = m.category ? `📂 <b>${escapeHtml(m.category)}</b>\n` : '';
-  const lines = (m.options || [])
-    .slice(0,3)
-    .map(o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`)
-    .join('\n');
-
+  const lines = uniqueOptions(m.options || []).slice(0,3).map(
+    o => `• ${escapeHtml(o.label)} — <b>${o.pct}%</b>`
+  ).join('\n');
   return [
     '📈 <b>Now Trending on Auracle</b>',
     `🏟️ <b>${escapeHtml(m.title)}</b>`,
@@ -636,7 +668,9 @@ function fmtTrending(m) {
   ].join('\n');
 }
 
-// ------------ Telegram Send Helper -------------
+/* =========================
+   TELEGRAM SEND
+========================= */
 async function send(msg, tag = '') {
   const chatId = getTargetChatId();
   try {
@@ -644,191 +678,232 @@ async function send(msg, tag = '') {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     });
-    if (dbg) console.log(`[send] OK to ${chatId}`, tag, m.message_id);
+    if (dbg) console.log(`[send] OK → chat ${chatId} ${tag ? '[' + tag + ']' : ''} message_id=${m?.message_id}`);
   } catch (e) {
     const desc = e?.response?.description || e.message;
     console.error('[send] ERROR → chat', chatId, desc);
   }
 }
 
-// ---------- MARKET TICK ENGINE ----------
+/* =========================
+   TICK ENGINE
+========================= */
 async function tick() {
-  console.log(`[tick] run @ ${new Date().toISOString()}`);
+  try {
+    console.log('[tick] run at', new Date().toISOString());
 
-  const state = loadState();
-  const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
+    const state = loadState();
+    const { trending, active } = await fetchMarketsFromSections({ debug: dbg });
 
-  const activeIds = new Set(active.map(m => m.id).filter(Boolean));
-  const trendingIds = new Set(trending.map(m => m.id).filter(Boolean));
-  const knownIds = new Set(Object.keys(state.markets || {}));
+    const activeIds   = new Set(active.map(m => m.id).filter(Boolean));
+    const trendingIds = new Set(trending.map(m => m.id).filter(Boolean));
+    const knownIds    = new Set(Object.keys(state.markets || {}));
 
-  // Track all present + known markets
-  const watchIds = new Set([...activeIds, ...trendingIds, ...knownIds]);
+    const toWatch = new Set([...activeIds, ...trendingIds, ...knownIds]);
+    for (const id of [...toWatch]) {
+      if (state.markets[id]?.retired) toWatch.delete(id);
+    }
+    console.log('[tick] tracking: active=', activeIds.size, 'trending=', trendingIds.size, 'known=', knownIds.size, '→ watch', toWatch.size);
 
-  // Strip retired markets
-  for (const id of [...watchIds]) {
-    if (state.markets[id]?.retired) watchIds.delete(id);
-  }
+    const activeById   = new Map(active.map(m => [m.id, m]));
+    const trendingById = new Map(trending.map(m => [m.id, m]));
+    const base = AURACLE_BASE_URL.replace(/\/+$/, '');
 
-  console.log(`[tick] tracking: active=${activeIds.size} trending=${trendingIds.size} known=${knownIds.size} → watch ${watchIds.size}`);
+    const results = [];
+    for (const id of toWatch) {
+      const prev = state.markets[id] || {};
+      const url =
+        prev.url ||
+        activeById.get(id)?.url ||
+        trendingById.get(id)?.url ||
+        `${base}/MarketDetails?id=${id}`;
 
-  // map for card lookup
-  const activeById = new Map(active.map(m => [m.id, m]));
-  const trendingById = new Map(trending.map(m => [m.id, m]));
-  const base = AURACLE_BASE_URL.replace(/\/+$/, '');
+      const detail = await scrapeMarketDetail(url, { debug: dbg });
+      if (!detail?.id) continue;
 
-  for (const id of watchIds) {
-    const prev = state.markets[id] || {
-      announcedOpen: false,
-      announcedClosed: false,
-      announcedResolved: false,
-      lastStatus: 'unknown',
-      lastSeen: null,
-      closedSnapshot: null,
-      wasTrending: false,
-      retired: false
-    };
-
-    const url =
-      prev.url ||
-      activeById.get(id)?.url ||
-      trendingById.get(id)?.url ||
-      `${base}/MarketDetails?id=${id}`;
-
-    const detail = await scrapeMarketDetail(url, { debug: dbg });
-    if (!detail?.id) continue;
-
-    const card = activeById.get(id) || trendingById.get(id);
-    const next = { ...prev, url: detail.url };
-
-    // OPEN: update lastSeen
-    if (detail.status === 'open') {
-      let endsIn = '';
-      if (detail.closeISO) {
-        const ms = Date.parse(detail.closeISO);
-        if (!isNaN(ms)) endsIn = humanizeEta(ms);
+      // If open, enrich from card and compute endsIn from closeISO when possible
+      if (detail.status === 'open') {
+        const card = activeById.get(detail.id) || trendingById.get(detail.id);
+        if (detail.closeISO) {
+          const ms = Date.parse(detail.closeISO);
+          if (Number.isFinite(ms)) detail.endsIn = humanizeEta(ms);
+        }
+        if (!detail.endsIn && card?.endsIn) detail.endsIn = card.endsIn;
+        if (card) {
+          detail.category = card.category || detail.category;
+          if (Array.isArray(card.options) && card.options.length >= 2) {
+            detail.options = uniqueOptions(card.options);
+          }
+        }
       }
-      if (!endsIn && card?.endsIn) endsIn = card.endsIn;
 
-      const opts = card?.options?.length
-        ? uniqueOptions(card.options)
-        : detail?.options?.length
-        ? uniqueOptions(detail.options)
-        : uniqueOptions(prev.lastSeen?.options || []);
+      results.push(detail);
+    }
 
-      next.lastSeen = {
-        title: detail.title,
-        category: card?.category ?? detail.category,
-        endsIn,
-        options: opts
+    // First run seed (no announcements)
+    if (!state.seeded && results.length) {
+      console.log('[seed] first run — seeding', results.length, 'markets');
+      for (const m of results) {
+        const inActive = activeIds.has(m.id);
+        const card = activeById.get(m.id) || trendingById.get(m.id);
+        state.markets[m.id] = {
+          announcedOpen:     m.status === 'open' && inActive,
+          announcedClosed:   m.status === 'closed',
+          announcedResolved: m.status === 'resolved',
+          lastStatus:        m.status,
+          url:               m.url,
+          missingCount:      0,
+          wasTrending:       trendingIds.has(m.id),
+          retired:           m.status === 'resolved',
+          lastSeen:          {
+            title: m.title,
+            category: (card?.category ?? m.category) || '',
+            endsIn: m.endsIn || card?.endsIn || '',
+            options: uniqueOptions((card?.options?.length ? card.options : m.options) || [])
+          },
+          closedSnapshot:    m.status === 'closed' ? { options: uniqueOptions(m.options || []) } : null
+        };
+      }
+      state.seeded = true;
+      saveState(state);
+      console.log('[seed] done');
+      return;
+    }
+
+    // Update missing counters
+    for (const id of Object.keys(state.markets)) {
+      state.markets[id].missingCount =
+        (activeIds.has(id) || trendingIds.has(id)) ? 0 : ((state.markets[id].missingCount || 0) + 1);
+    }
+
+    // Transitions + announcements
+    for (const m of results) {
+      const prev = state.markets[m.id] || {
+        announcedOpen: false, announcedClosed: false, announcedResolved: false,
+        lastStatus: 'unknown', url: m.url, missingCount: 0,
+        lastSeen: null, closedSnapshot: null, wasTrending: false, retired: false
       };
+      const next = { ...prev, url: m.url };
+
+      // update lastSeen while open
+      if (m.status === 'open') {
+        const card = activeById.get(m.id) || trendingById.get(m.id);
+        const seenOpts = card?.options?.length ? card.options : m.options;
+        next.lastSeen = {
+          title: m.title,
+          category: card?.category ?? m.category ?? prev.lastSeen?.category ?? '',
+          endsIn: m.endsIn || card?.endsIn || prev.lastSeen?.endsIn || '',
+          options: uniqueOptions(seenOpts?.length ? seenOpts : (prev.lastSeen?.options || []))
+        };
+      }
+
+      // capture snapshot on first closed detect (from detail only)
+      if (m.status === 'closed' && !prev.announcedClosed && !next.closedSnapshot) {
+        const finalOpts = (prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || [];
+        next.closedSnapshot = { options: uniqueOptions(finalOpts) };
+      }
+
+      // announce new open (only if in Active)
+      if (m.status === 'open' && activeIds.has(m.id) && !prev.announcedOpen) {
+        const card = activeById.get(m.id);
+        const opts = uniqueOptions(
+          (card?.options?.length ? card.options :
+           prev.lastSeen?.options?.length ? prev.lastSeen.options :
+           m.options) || []
+        );
+        await send(
+          fmtNewMarket({
+            ...m,
+            title: m.title || prev.lastSeen?.title || 'Unknown',
+            category: next.lastSeen?.category,
+            endsIn: next.lastSeen?.endsIn,
+            options: opts
+          }),
+          'OPEN'
+        );
+        next.announcedOpen = true;
+      }
+
+      // announce closed
+      if (m.status === 'closed' && !prev.announcedClosed && prev.lastStatus !== 'closed') {
+        const closedOptions =
+          next.closedSnapshot?.options?.length ? next.closedSnapshot.options
+            : uniqueOptions((prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || []);
+
+        await send(
+          fmtClosed({
+            ...m,
+            title: m.title || prev.lastSeen?.title || 'Unknown',
+            options: closedOptions
+          }),
+          'CLOSED'
+        );
+        next.announcedClosed = true;
+      }
+
+      // announce resolved and retire
+      if (m.status === 'resolved' && !prev.announcedResolved) {
+        const finalOptions =
+          next.closedSnapshot?.options?.length ? next.closedSnapshot.options
+            : uniqueOptions((prev.lastSeen?.options?.length ? prev.lastSeen.options : m.options) || []);
+
+        await send(
+          fmtResolved({
+            ...m,
+            title: m.title || prev.lastSeen?.title || 'Unknown',
+            options: finalOptions
+          }),
+          'RESOLVED'
+        );
+
+        next.announcedResolved = true;
+        next.retired = true;
+      }
+
+      // trending entry
+      const isTrendingNow = trendingIds.has(m.id);
+      if (isTrendingNow && !prev.wasTrending) {
+        const card = activeById.get(m.id) || trendingById.get(m.id);
+        const opts = uniqueOptions(
+          (card?.options?.length ? card.options :
+           prev.lastSeen?.options?.length ? prev.lastSeen.options :
+           m.options) || []
+        );
+        await send(
+          fmtTrending({
+            ...m,
+            title: m.title || card?.title || prev.lastSeen?.title || 'Unknown',
+            category: card?.category ?? m.category,
+            options: opts
+          }),
+          'TRENDING'
+        );
+      }
+      next.wasTrending = isTrendingNow;
+
+      next.lastStatus = m.status;
+      state.markets[m.id] = next;
     }
 
-    // CLOSED: capture final pool once
-    if (detail.status === 'closed' && !prev.announcedClosed && !next.closedSnapshot) {
-      const opts = prev.lastSeen?.options?.length
-        ? prev.lastSeen.options
-        : detail.options || [];
-      next.closedSnapshot = { options: uniqueOptions(opts) };
+    // Cleanup retired if state grows too big
+    const MAX_RETIRED = 2000;
+    const ids = Object.keys(state.markets);
+    if (ids.length > MAX_RETIRED) {
+      for (const id of ids) {
+        if (state.markets[id]?.retired) delete state.markets[id];
+      }
     }
 
-    // ---- ANNOUNCE NEW MARKET ----
-    if (detail.status === 'open' && activeById.has(id) && !prev.announcedOpen) {
-      const opts = next.lastSeen?.options?.length
-        ? next.lastSeen.options
-        : uniqueOptions(detail.options || []);
-      await send(
-        fmtNewMarket({
-          ...detail,
-          category: next.lastSeen?.category,
-          endsIn: next.lastSeen?.endsIn,
-          options: opts
-        }),
-        'OPEN'
-      );
-      next.announcedOpen = true;
-    }
-
-    // ---- ANNOUNCE CLOSED ----
-    if (detail.status === 'closed' && !prev.announcedClosed && prev.lastStatus !== 'closed') {
-      const opts =
-        next.closedSnapshot?.options?.length
-          ? next.closedSnapshot.options
-          : uniqueOptions(prev.lastSeen?.options || detail.options || []);
-
-      await send(
-        fmtClosed({
-          ...detail,
-          options: opts,
-          title: next.lastSeen?.title || detail.title
-        }),
-        'CLOSED'
-      );
-
-      next.announcedClosed = true;
-    }
-
-    // ---- ANNOUNCE RESOLVED ----
-    if (detail.status === 'resolved' && !prev.announcedResolved) {
-      // Build the best options set (final pool) first
-      const finalOptions =
-        next.closedSnapshot?.options?.length
-          ? next.closedSnapshot.options
-          : uniqueOptions(prev.lastSeen?.options || detail.options || []);
-
-      // Map "YES/NO/DRAW" to team name where possible
-      const mappedWinner = mapWinnerToLabel(detail.winner, finalOptions);
-
-      await send(
-        fmtResolved({
-          ...detail,
-          winner: mappedWinner,
-          options: finalOptions,
-          title: next.lastSeen?.title || detail.title
-        }),
-        'RESOLVED'
-      );
-
-      next.announcedResolved = true;
-      next.retired = true; // stop tracking
-    }
-
-    // ---- ANNOUNCE TRENDING ENTRY ----
-    const trendingNow = trendingIds.has(id);
-    if (trendingNow && !prev.wasTrending) {
-      const opts =
-        next.lastSeen?.options?.length
-          ? next.lastSeen.options
-          : uniqueOptions(detail.options || []);
-      await send(
-        fmtTrending({
-          ...detail,
-          options: opts,
-          category: next.lastSeen?.category
-        }),
-        'TRENDING'
-      );
-    }
-    next.wasTrending = trendingNow;
-
-    next.lastStatus = detail.status;
-    state.markets[id] = next;
+    saveState(state);
+    if (dbg) console.log('[tick] done', summarizeState(state));
+  } catch (e) {
+    console.error('tick error:', e.message);
   }
-
-  // Optional compacting of retired
-  const MAX_RETIRED = 2000;
-  const ids = Object.keys(state.markets);
-  if (ids.length > MAX_RETIRED) {
-    for (const id of ids) {
-      if (state.markets[id]?.retired) delete state.markets[id];
-    }
-  }
-
-  saveState(state);
-  console.log('[tick] done ✅');
 }
 
-// ---------- Commands ----------
+/* =========================
+   COMMANDS
+========================= */
 bot.command('ping', (ctx) => ctx.reply('pong 🏓'));
 
 bot.command('health', async (ctx) => {
@@ -886,7 +961,7 @@ bot.command('announce_open_now', async (ctx) => {
       id: card.id || detail?.id,
       url: detail?.url || card.url,
       title: (detail?.title || 'Unknown').toUpperCase(),
-      options: (card.options?.length ? uniqueOptions(card.options) : uniqueOptions(detail?.options || []))
+      options: uniqueOptions(card.options?.length ? card.options : (detail?.options || []))
     };
     await send(fmtNewMarket(merged), 'OPEN(TEST)');
     const st = loadState();
@@ -933,11 +1008,13 @@ bot.command('reseed_off', async (ctx) => {
   await ctx.reply('Seeding disabled (seeded=true).');
 });
 
-// ---------- Boot: bot + robust scheduler ----------
+/* =========================
+   BOOT + LOOP + HTTP
+========================= */
 (async () => {
   try {
     await bot.launch();
-    console.log('[bot] started (polling).');
+    console.log('✅ Bot running');
     await bot.telegram.setMyCommands([
       { command: 'ping', description: 'Ping the bot' },
       { command: 'health', description: 'Active/Trending counts (titles from details)' },
@@ -946,6 +1023,7 @@ bot.command('reseed_off', async (ctx) => {
       { command: 'announce_open_now', description: 'Announce N open markets now (from Active)' },
       { command: 'tick_now', description: 'Run a tick immediately' },
       { command: 'state', description: 'Show tracked/announced counts' },
+      { command: 'reseed_off', description: 'Disable seeding (mark seeded=true)' },
     ]);
   } catch (e) {
     console.error('[bot] launch error:', e?.message || e);
@@ -954,25 +1032,26 @@ bot.command('reseed_off', async (ctx) => {
 
 // Heartbeat every 10s
 setInterval(() => {
-  console.log(`[hb] alive @ ${new Date().toISOString()} uptime=${process.uptime().toFixed(1)}s`);
+  console.log(`[hb] ${new Date().toISOString()}`);
 }, 10_000);
 
 // Self-rescheduling loop (no cron)
 const intervalSec = Math.max(5, parseInt(POLL_INTERVAL_SECONDS || '30', 10));
 console.log(`[loop] arming self-scheduler every ${intervalSec}s (TZ=${TZ})`);
 async function loopTick() {
-  console.log(`[loop] fire @ ${new Date().toISOString()}`);
+  console.log(`[tick] START ${new Date().toISOString()}`);
   try {
     await tick();
   } catch (e) {
     console.error('[loop] tick error:', e?.message || e);
   } finally {
+    console.log(`[tick] END ${new Date().toISOString()}`);
     setTimeout(loopTick, intervalSec * 1000);
   }
 }
-loopTick(); // kick off
+loopTick();
 
-// ---------- HTTP server ----------
+// HTTP server (Railway health)
 const server = http.createServer(async (req, res) => {
   if (req.url === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -983,9 +1062,9 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Auracle Telegram bot is running.\n');
 });
-server.listen(PORT, () => console.log(`[http] listening on :${PORT}`));
+server.listen(PORT, () => console.log(`[HTTP] listening on ${PORT}`));
 
-// ---------- Shutdown + error traps ----------
+// Graceful shutdown
 process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 process.once('SIGINT', async () => { try { if (browser) await browser.close(); } catch {} bot.stop('SIGINT'); server.close(); });

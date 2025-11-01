@@ -237,133 +237,103 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
         const seenUrls = new Set();
         const entries = [];
 
-        for (const a of anchors) {
-          const href = a.getAttribute('href') || '';
-          const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
-          if (seenUrls.has(abs)) continue;
-          seenUrls.add(abs);
+for (const a of anchors) {
+  const href = a.getAttribute('href') || '';
+  const abs = href.startsWith('http') ? href : `${location.origin}${href}`;
+  if (seenUrls.has(abs)) continue;
+  seenUrls.add(abs);
 
-          const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
+  const cardRoot = a.closest('article, section, div.card, div') || a.parentElement;
 
-          // Category (best-effort)
-          const category = text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
+  // Category (best-effort)
+  const category = text(cardRoot?.querySelector('.badge, .chip, .category, [data-testid="category"]')) || '';
 
-          // endsIn text ("in about X hours/days…")
-          const MINUTES = (n, unit) => {
-            unit = (unit || '').toLowerCase();
-            if (unit.startsWith('day'))   return n * 24 * 60;
-            if (unit.startsWith('hour'))  return n * 60;
-            if (unit.startsWith('min'))   return n;
-            return n;
-          };
-          let endsIn = '';
-          let bestMins = -1;
-          const timeNodes = Array.from(
-            cardRoot?.querySelectorAll(
-              'time, [data-testid="ends-in"], .ends-in, .text-xs, .text-sm, [class*="ends"], [class*="countdown"]'
-            ) || []
-          );
-          for (const el of timeNodes) {
-            const t = (el.textContent || '').trim();
-            const re = /\b(?:in\s+about|about|in)\s+(\d+)\s*(days?|hours?|minutes?)\b/i;
-            const m = t.match(re);
-            if (m) {
-              const n = parseInt(m[1], 10);
-              const mins = MINUTES(n, m[2]);
-              if (Number.isFinite(mins) && mins > bestMins) {
-                bestMins = mins;
-                endsIn = t;
-              }
-            }
-          }
-
-          // Options with % (best-effort, 2–3 rows)
-          const rowSelectors = [
-            '.option', '.side', '.row',
-            '.left, .center, .right',
-            '[data-option]', '[role="listitem"]',
-            '.market-option', '.market-side'
-          ].join(',');
-
-          const labelSel = [
-            '.label', '.name', '.team', '.option-label',
-            '[data-testid="option-label"]', '[data-testid="option-name"]',
-            'strong', 'span', 'p'
-          ].join(',');
-
-          const pctSel = [
-            '.percent', '.percentage', '.progress-label', '.option-percent',
-            '[data-testid="option-percent"]'
-          ].join(',');
-
-          let options = [];
-          const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
-          for (const row of rows) {
-            const pctNode = row.querySelector(pctSel);
-            const lblNode = row.querySelector(labelSel);
-            if (!pctNode || !lblNode) continue;
-            const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
-            const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
-            const label = text(lblNode);
-            if (!label || pct === null) continue;
-            options.push({ label, pct });
-            if (options.length >= 3) break;
-          }
-
-// simple de-dupe with "CURRENT " stripping (same normalization as cleanLabel)
-const oOut = [];
-const seen = new Set();
-for (const o of options) {
-  const raw = (o.label || "").trim();
-  // normalize: strip "CURRENT " + optional dash
-  const lbl = raw.replace(/^CURRENT\s*[–—-]?\s*/i, "").replace(/\s+/g, " ");
-  const key = lbl.toUpperCase();
-  if (!key || seen.has(key)) continue;
-  seen.add(key);
-  oOut.push({ label: lbl, pct: o.pct });
-  if
-
-          // ID
-          let id = null;
-          try {
-            const u = new URL(abs);
-            id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
-          } catch {}
-
-          const entry = { id, url: abs, title: '', category, endsIn, options: oOut, status: 'open' };
-          const trending = HAS_HOT(cardRoot);
-          entries.push({ entry, trending });
-        }
-
-        // Dedup by ID/URL
-        const byKey = new Map();
-        for (const { entry, trending } of entries) {
-          const key = entry.id || entry.url;
-          if (!byKey.has(key)) byKey.set(key, { entry, trending });
-        }
-
-        const trendingArr = [];
-        const activeArr = [];
-        for (const { entry, trending } of byKey.values()) {
-          if (trending) trendingArr.push(entry);
-          else activeArr.push(entry);
-        }
-
-        // If only one shape shows up, treat as Active
-        if (activeArr.length === 0 && trendingArr.length > 0) {
-          return { trending: [], active: trendingArr };
-        }
-        return { trending: trendingArr, active: activeArr };
-      });
-
-      await page.close();
-      if (debug || dbg) console.log('[sections] trending:', data.trending.length, 'active:', data.active.length);
-      return data;
-    } catch (err) {
-      if (debug || dbg) console.log('[sections] error', err.message);
+  // endsIn text ("in about X hours/days…")
+  const MINUTES = (n, unit) => {
+    unit = (unit || '').toLowerCase();
+    if (unit.startsWith('day'))   return n * 24 * 60;
+    if (unit.startsWith('hour'))  return n * 60;
+    if (unit.startsWith('min'))   return n;
+    return n;
+  };
+  let endsIn = '';
+  let bestMins = -1;
+  const timeNodes = Array.from(
+    cardRoot?.querySelectorAll(
+      'time, [data-testid="ends-in"], .ends-in, .text-xs, .text-sm, [class*="ends"], [class*="countdown"]'
+    ) || []
+  );
+  for (const el of timeNodes) {
+    const t = (el.textContent || '').trim();
+    const re = /\b(?:in\s+about|about|in)\s+(\d+)\s*(days?|hours?|minutes?)\b/i;
+    const m = t.match(re);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      const mins = MINUTES(n, m[2]);
+      if (Number.isFinite(mins) && mins > bestMins) {
+        bestMins = mins;
+        endsIn = t;
+      }
     }
   }
-  return { trending: [], active: [] };
+
+  // Options with % (best-effort, 2–3 rows)
+  const rowSelectors = [
+    '.option', '.side', '.row',
+    '.left, .center, .right',
+    '[data-option]', '[role="listitem"]',
+    '.market-option', '.market-side'
+  ].join(',');
+
+  const labelSel = [
+    '.label', '.name', '.team', '.option-label',
+    '[data-testid="option-label"]', '[data-testid="option-name"]',
+    'strong', 'span', 'p'
+  ].join(',');
+
+  const pctSel = [
+    '.percent', '.percentage', '.progress-label', '.option-percent',
+    '[data-testid="option-percent"]'
+  ].join(',');
+
+  let options = [];
+  const rows = Array.from(cardRoot?.querySelectorAll(rowSelectors) || []);
+  for (const row of rows) {
+    const pctNode = row.querySelector(pctSel);
+    const lblNode = row.querySelector(labelSel);
+    if (!pctNode || !lblNode) continue;
+    const pctStr = (pctNode.textContent || '').replace('%','').replace(/[^\d.]/g,'');
+    const pct = Number.isFinite(parseFloat(pctStr)) ? Math.round(parseFloat(pctStr)) : null;
+    const rawLabel = (lblNode.textContent || '').trim();
+    if (!rawLabel || pct === null) continue;
+    options.push({ label: rawLabel, pct });
+    if (options.length >= 3) break;
+  }
+
+  // ✅ de-dupe + normalize labels (strip leading "CURRENT " and dashes)
+  const oOut = [];
+  const seen = new Set();
+  for (const o of options) {
+    const raw = (o.label || '').trim();
+    const lbl = raw.replace(/^CURRENT\s*[–—-]?\s*/i, '').replace(/\s+/g, ' ');
+    const key = lbl.toUpperCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    oOut.push({ label: lbl, pct: o.pct });
+    if (oOut.length >= 3) break;
+  }
+
+  // ID
+  let id = null;
+  try {
+    const u = new URL(abs);
+    id = u.searchParams.get('id') || (u.pathname.match(/\/markets\/([^/]+)/i)?.[1] || null);
+  } catch {}
+
+  // Build entry
+  const entry = { id, url: abs, title: '', category, endsIn, options: oOut, status: 'open' };
+  const trending = HAS_HOT(cardRoot);
+  entries.push({ entry, trending });
 }
 
 // ---------- Detail Scraper ----------

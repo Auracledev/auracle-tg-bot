@@ -89,9 +89,17 @@ function escapeHtml(s = '') {
 // Winner/option cleanup
 function cleanLabel(label = "") {
   if (!label) return "";
-  let s = label.trim();
+  // strip leading "CURRENT " (and any em/en dashes right after)
+  let s = label.replace(/^CURRENT\s*[–—-]?\s*/i, "").trim();
+
+  // drop obvious noise tokens
   const banned = ["PROBABILITY", "CHART", "POOL", "SPORTS", "WINS", "IMPLIED"];
   if (banned.some(b => s.toUpperCase().includes(b))) return "";
+
+  // collapse inner whitespace
+  s = s.replace(/\s+/g, " ");
+
+  // keep it tidy
   if (s.length > 40) s = s.slice(0, 40);
   return s;
 }
@@ -302,16 +310,18 @@ async function fetchMarketsFromSections({ debug = false } = {}) {
             if (options.length >= 3) break;
           }
 
-          // simple de-dupe
-          const oOut = [];
-          const seen = new Set();
-          for (const o of options) {
-            const key = (o.label || '').trim().toUpperCase();
-            if (!key || seen.has(key)) continue;
-            seen.add(key);
-            oOut.push({ label: (o.label || '').trim(), pct: o.pct });
-            if (oOut.length >= 3) break;
-          }
+// simple de-dupe with "CURRENT " stripping (same normalization as cleanLabel)
+const oOut = [];
+const seen = new Set();
+for (const o of options) {
+  const raw = (o.label || "").trim();
+  // normalize: strip "CURRENT " + optional dash
+  const lbl = raw.replace(/^CURRENT\s*[–—-]?\s*/i, "").replace(/\s+/g, " ");
+  const key = lbl.toUpperCase();
+  if (!key || seen.has(key)) continue;
+  seen.add(key);
+  oOut.push({ label: lbl, pct: o.pct });
+  if
 
           // ID
           let id = null;
